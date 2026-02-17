@@ -27,6 +27,23 @@ kernel void kernel_mul_mat_Ab_Bi_8x4(
         int k,                              // K
         int n_no_padding                    // N without padding
 ) {
+#if defined(USE_KAHAN_ACC) || defined(USE_F32_ACT)
+#define ACCUM_FP32 1
+#endif
+
+#ifdef USE_F32_ACT
+#define READ_ACT4(img, idx) read_imagef((img), (idx))
+#elif defined(ACCUM_FP32)
+#define READ_ACT4(img, idx) convert_float4(read_imageh((img), (idx)))
+#else
+#define READ_ACT4(img, idx) read_imageh((img), (idx))
+#endif
+
+#ifdef ACCUM_FP32
+#define SCALE_CAST(v) ((float)(v))
+#else
+#define SCALE_CAST(v) (v)
+#endif
 
     int m_4 = m >> 2;
     int n_4 = n >> 2;
@@ -35,16 +52,40 @@ kernel void kernel_mul_mat_Ab_Bi_8x4(
     int gx = get_global_id(1);
     int gx_2 = gx << 2;
 
-    half8 c0 = 0, c1 = 0, c2 = 0, c3 = 0; // 8x4 output elements
+#ifdef ACCUM_FP32
+    float8 c0 = 0, c1 = 0, c2 = 0, c3 = 0; // 8x4 output elements
+#else
+    half8 c0 = (half8)(0), c1 = (half8)(0), c2 = (half8)(0), c3 = (half8)(0); // 8x4 output elements
+#endif
+#ifdef USE_KAHAN_ACC
+    float8 c0_corr = 0, c1_corr = 0, c2_corr = 0, c3_corr = 0;
+#define ACC_ADD(sum, corr, val)             \
+    do {                                    \
+        float8 y = (val) - (corr);          \
+        float8 t = (sum) + y;               \
+        (corr) = (t - (sum)) - y;           \
+        (sum) = t;                          \
+    } while (0)
+#else
+#define ACC_ADD(sum, corr, val) \
+    do {                        \
+        (sum) += (val);         \
+    } while (0)
+#endif
+#ifdef ACCUM_FP32
+    float8 B; // registers for activations
+    float4 dequantized_weights; // registers for dequantized weights
+#else
     half8 B; // registers for activations
     half4 dequantized_weights; // registers for dequantized weights
+#endif
     __global const ushort* weight_ptr = src0_q + gx_2; // pointer for weights
     __global const half* scale_ptr = src0_d + gx_2; // pointer for scales
 
     for(int i=0; i<k; i+=4){ //loop through K dimension
 
-        B.s0123 = read_imageh(src1, gy*2 + (i)*(n_4));
-        B.s4567 = read_imageh(src1, gy*2 + (i)*(n_4)+1);
+        B.s0123 = READ_ACT4(src1, gy*2 + (i)*(n_4));
+        B.s4567 = READ_ACT4(src1, gy*2 + (i)*(n_4)+1);
 
         // keep (i/4) and (i/32) in parenthesis, rounds down
         // load 4 consecutive groups of 4 weights
@@ -54,50 +95,50 @@ kernel void kernel_mul_mat_Ab_Bi_8x4(
         half4 scale = vload4(0, scale_ptr + (i/32)*(m));// (i/32) because 1 scale per 32 elements
 
         // j=0
-        dequantized_weights.s0 = ((bits4.s0 & (0x000F)) - 8) * scale.s0; // dequantize a row of the 16 weights
-        dequantized_weights.s1 = ((bits4.s1 & (0x000F)) - 8) * scale.s1;
-        dequantized_weights.s2 = ((bits4.s2 & (0x000F)) - 8) * scale.s2;
-        dequantized_weights.s3 = ((bits4.s3 & (0x000F)) - 8) * scale.s3;
-        c0 += B * dequantized_weights.s0; // vector-scalar multiplication to accumulate
-        c1 += B * dequantized_weights.s1;
-        c2 += B * dequantized_weights.s2;
-        c3 += B * dequantized_weights.s3;
+        dequantized_weights.s0 = ((bits4.s0 & (0x000F)) - 8) * SCALE_CAST(scale.s0); // dequantize a row of the 16 weights
+        dequantized_weights.s1 = ((bits4.s1 & (0x000F)) - 8) * SCALE_CAST(scale.s1);
+        dequantized_weights.s2 = ((bits4.s2 & (0x000F)) - 8) * SCALE_CAST(scale.s2);
+        dequantized_weights.s3 = ((bits4.s3 & (0x000F)) - 8) * SCALE_CAST(scale.s3);
+        ACC_ADD(c0, c0_corr, B * dequantized_weights.s0); // vector-scalar multiplication to accumulate
+        ACC_ADD(c1, c1_corr, B * dequantized_weights.s1);
+        ACC_ADD(c2, c2_corr, B * dequantized_weights.s2);
+        ACC_ADD(c3, c3_corr, B * dequantized_weights.s3);
 
         // j=1
-        B.s0123 = read_imageh(src1, gy*2 + (i+1)*(n_4));
-        B.s4567 = read_imageh(src1, gy*2 + (i+1)*(n_4)+1);
-        dequantized_weights.s0 = (((bits4.s0 & (0x00F0)) >> 4) - 8) * scale.s0; // dequantize a row of the 16 weights
-        dequantized_weights.s1 = (((bits4.s1 & (0x00F0)) >> 4) - 8) * scale.s1;
-        dequantized_weights.s2 = (((bits4.s2 & (0x00F0)) >> 4) - 8) * scale.s2;
-        dequantized_weights.s3 = (((bits4.s3 & (0x00F0)) >> 4) - 8) * scale.s3;
-        c0 += B * dequantized_weights.s0; //vector-scalar multiplication to accumulate
-        c1 += B * dequantized_weights.s1;
-        c2 += B * dequantized_weights.s2;
-        c3 += B * dequantized_weights.s3;
+        B.s0123 = READ_ACT4(src1, gy*2 + (i+1)*(n_4));
+        B.s4567 = READ_ACT4(src1, gy*2 + (i+1)*(n_4)+1);
+        dequantized_weights.s0 = (((bits4.s0 & (0x00F0)) >> 4) - 8) * SCALE_CAST(scale.s0); // dequantize a row of the 16 weights
+        dequantized_weights.s1 = (((bits4.s1 & (0x00F0)) >> 4) - 8) * SCALE_CAST(scale.s1);
+        dequantized_weights.s2 = (((bits4.s2 & (0x00F0)) >> 4) - 8) * SCALE_CAST(scale.s2);
+        dequantized_weights.s3 = (((bits4.s3 & (0x00F0)) >> 4) - 8) * SCALE_CAST(scale.s3);
+        ACC_ADD(c0, c0_corr, B * dequantized_weights.s0); //vector-scalar multiplication to accumulate
+        ACC_ADD(c1, c1_corr, B * dequantized_weights.s1);
+        ACC_ADD(c2, c2_corr, B * dequantized_weights.s2);
+        ACC_ADD(c3, c3_corr, B * dequantized_weights.s3);
 
         // j=2
-        B.s0123 = read_imageh(src1, gy*2 + (i+2)*(n_4));
-        B.s4567 = read_imageh(src1, gy*2 + (i+2)*(n_4)+1);
-        dequantized_weights.s0 = (((bits4.s0 & (0x0F00)) >> 8) - 8) * scale.s0; // dequantize a row of the 16 weights
-        dequantized_weights.s1 = (((bits4.s1 & (0x0F00)) >> 8) - 8) * scale.s1;
-        dequantized_weights.s2 = (((bits4.s2 & (0x0F00)) >> 8) - 8) * scale.s2;
-        dequantized_weights.s3 = (((bits4.s3 & (0x0F00)) >> 8) - 8) * scale.s3;
-        c0 += B * dequantized_weights.s0; // vector-scalar multiplication to accumulate
-        c1 += B * dequantized_weights.s1;
-        c2 += B * dequantized_weights.s2;
-        c3 += B * dequantized_weights.s3;
+        B.s0123 = READ_ACT4(src1, gy*2 + (i+2)*(n_4));
+        B.s4567 = READ_ACT4(src1, gy*2 + (i+2)*(n_4)+1);
+        dequantized_weights.s0 = (((bits4.s0 & (0x0F00)) >> 8) - 8) * SCALE_CAST(scale.s0); // dequantize a row of the 16 weights
+        dequantized_weights.s1 = (((bits4.s1 & (0x0F00)) >> 8) - 8) * SCALE_CAST(scale.s1);
+        dequantized_weights.s2 = (((bits4.s2 & (0x0F00)) >> 8) - 8) * SCALE_CAST(scale.s2);
+        dequantized_weights.s3 = (((bits4.s3 & (0x0F00)) >> 8) - 8) * SCALE_CAST(scale.s3);
+        ACC_ADD(c0, c0_corr, B * dequantized_weights.s0); // vector-scalar multiplication to accumulate
+        ACC_ADD(c1, c1_corr, B * dequantized_weights.s1);
+        ACC_ADD(c2, c2_corr, B * dequantized_weights.s2);
+        ACC_ADD(c3, c3_corr, B * dequantized_weights.s3);
 
         // j=3
-        B.s0123 = read_imageh(src1, gy*2 + (i+3)*(n_4));
-        B.s4567 = read_imageh(src1, gy*2 + (i+3)*(n_4)+1);
-        dequantized_weights.s0 = (((bits4.s0 & (0xF000)) >> 12) - 8) * scale.s0; // dequantize a row of the 16 weights
-        dequantized_weights.s1 = (((bits4.s1 & (0xF000)) >> 12) - 8) * scale.s1;
-        dequantized_weights.s2 = (((bits4.s2 & (0xF000)) >> 12) - 8) * scale.s2;
-        dequantized_weights.s3 = (((bits4.s3 & (0xF000)) >> 12) - 8) * scale.s3;
-        c0 += B * dequantized_weights.s0; // vector-scalar multiplication to accumulate
-        c1 += B * dequantized_weights.s1;
-        c2 += B * dequantized_weights.s2;
-        c3 += B * dequantized_weights.s3;
+        B.s0123 = READ_ACT4(src1, gy*2 + (i+3)*(n_4));
+        B.s4567 = READ_ACT4(src1, gy*2 + (i+3)*(n_4)+1);
+        dequantized_weights.s0 = (((bits4.s0 & (0xF000)) >> 12) - 8) * SCALE_CAST(scale.s0); // dequantize a row of the 16 weights
+        dequantized_weights.s1 = (((bits4.s1 & (0xF000)) >> 12) - 8) * SCALE_CAST(scale.s1);
+        dequantized_weights.s2 = (((bits4.s2 & (0xF000)) >> 12) - 8) * SCALE_CAST(scale.s2);
+        dequantized_weights.s3 = (((bits4.s3 & (0xF000)) >> 12) - 8) * SCALE_CAST(scale.s3);
+        ACC_ADD(c0, c0_corr, B * dequantized_weights.s0); // vector-scalar multiplication to accumulate
+        ACC_ADD(c1, c1_corr, B * dequantized_weights.s1);
+        ACC_ADD(c2, c2_corr, B * dequantized_weights.s2);
+        ACC_ADD(c3, c3_corr, B * dequantized_weights.s3);
     }
 
     int idx = (gy<<3)*m + (gx<<2); // vectorized store 16 elements
@@ -136,4 +177,9 @@ kernel void kernel_mul_mat_Ab_Bi_8x4(
     if(idx+3 < m*n_no_padding){
         vstore4((float4)(c0.s7, c1.s7, c2.s7, c3.s7), 0, dst + idx);
     }
+
+#undef ACC_ADD
+#undef SCALE_CAST
+#undef READ_ACT4
+#undef ACCUM_FP32
 }

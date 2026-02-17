@@ -212,6 +212,12 @@ __kernel void kernel_gemv_noshuffle(
     uint gid     = get_global_id(0);
     ushort slid    = get_sub_group_local_id();
 
+    // global size is rounded up to wave-size alignment; drop extra lanes
+    // so they do not read/write past valid rows.
+    if (gid >= LINE_STRIDE_A) {
+        return;
+    }
+
     __private uint4     regA;
     __private half2     regS;
     __private float8    regB;

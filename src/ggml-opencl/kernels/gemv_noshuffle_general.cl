@@ -218,6 +218,12 @@ __kernel void kernel_gemv_noshuffle(
     uint LINE_STRIDE_A = M / 2;
     uint BLOCK_STRIDE_A = N_SIMDGROUP * M;
 
+    // global size is rounded up to wave-size alignment; drop extra lanes
+    // so they do not read/write past valid rows.
+    if (gid >= LINE_STRIDE_A) {
+        return;
+    }
+
     __private uint4     regA;
     __private half2     regS;
     __private float8    regB;

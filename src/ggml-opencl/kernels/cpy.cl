@@ -182,3 +182,95 @@ kernel void kernel_cpy_f32_f32(
         dst_data[i00] = src[0];
     }
 }
+
+// 1D fallback copy for permuted/strided views (avoids 3D NDRange on some drivers)
+kernel void kernel_cpy_f32_f32_1d(
+        global float * src0,
+        ulong offset0,
+        global float * dst,
+        ulong offsetd,
+        int ne00,
+        int ne01,
+        int ne02,
+        int ne03,
+        ulong nb00,
+        ulong nb01,
+        ulong nb02,
+        ulong nb03,
+        int ne0,
+        int ne1,
+        int ne2,
+        int ne3,
+        ulong nb0,
+        ulong nb1,
+        ulong nb2,
+        ulong nb3
+) {
+    src0 = (global float *)((global char *)src0 + offset0);
+    dst  = (global float *)((global char *)dst  + offsetd);
+
+    size_t idx = get_global_id(0);
+    size_t total = (size_t)ne0 * (size_t)ne1 * (size_t)ne2 * (size_t)ne3;
+    if (idx >= total) {
+        return;
+    }
+
+    size_t n = idx;
+    int i3 = (int)(n / ((size_t)ne2 * (size_t)ne1 * (size_t)ne0));
+    n -= (size_t)i3 * (size_t)ne2 * (size_t)ne1 * (size_t)ne0;
+    int i2 = (int)(n / ((size_t)ne1 * (size_t)ne0));
+    n -= (size_t)i2 * (size_t)ne1 * (size_t)ne0;
+    int i1 = (int)(n / (size_t)ne0);
+    int i0 = (int)(n - (size_t)i1 * (size_t)ne0);
+
+    global const float * src = (global float *)((global char *)src0 + (ulong)i3*nb03 + (ulong)i2*nb02 + (ulong)i1*nb01 + (ulong)i0*nb00);
+    global float * dst_data  = (global float *)((global char *)dst  + (ulong)i3*nb3  + (ulong)i2*nb2  + (ulong)i1*nb1  + (ulong)i0*nb0);
+
+    dst_data[0] = src[0];
+}
+
+// 1D fallback copy for permuted/strided views (avoids 3D NDRange on some drivers)
+kernel void kernel_cpy_f16_f16_1d(
+        global half * src0,
+        ulong offset0,
+        global half * dst,
+        ulong offsetd,
+        int ne00,
+        int ne01,
+        int ne02,
+        int ne03,
+        ulong nb00,
+        ulong nb01,
+        ulong nb02,
+        ulong nb03,
+        int ne0,
+        int ne1,
+        int ne2,
+        int ne3,
+        ulong nb0,
+        ulong nb1,
+        ulong nb2,
+        ulong nb3
+) {
+    src0 = (global half *)((global char *)src0 + offset0);
+    dst  = (global half *)((global char *)dst  + offsetd);
+
+    size_t idx = get_global_id(0);
+    size_t total = (size_t)ne0 * (size_t)ne1 * (size_t)ne2 * (size_t)ne3;
+    if (idx >= total) {
+        return;
+    }
+
+    size_t n = idx;
+    int i3 = (int)(n / ((size_t)ne2 * (size_t)ne1 * (size_t)ne0));
+    n -= (size_t)i3 * (size_t)ne2 * (size_t)ne1 * (size_t)ne0;
+    int i2 = (int)(n / ((size_t)ne1 * (size_t)ne0));
+    n -= (size_t)i2 * (size_t)ne1 * (size_t)ne0;
+    int i1 = (int)(n / (size_t)ne0);
+    int i0 = (int)(n - (size_t)i1 * (size_t)ne0);
+
+    global const half * src = (global half *)((global char *)src0 + (ulong)i3*nb03 + (ulong)i2*nb02 + (ulong)i1*nb01 + (ulong)i0*nb00);
+    global half * dst_data  = (global half *)((global char *)dst  + (ulong)i3*nb3  + (ulong)i2*nb2  + (ulong)i1*nb1  + (ulong)i0*nb0);
+
+    dst_data[0] = src[0];
+}

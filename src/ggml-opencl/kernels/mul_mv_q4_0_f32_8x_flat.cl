@@ -270,3 +270,61 @@ kernel void kernel_mul_mat_q4_0_f32_8x_flat(
 
     mul_vec_q_n_f32_8x_flat(src0_q, src0_d, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3);
 }
+
+// Reference kernel for correctness: one work-item computes one output element.
+// This is intentionally slow and meant for validation (e.g., GGML_OPENCL_Q4_0_REF).
+kernel void kernel_mul_mat_q4_0_f32_ref(
+        global uchar * src0_q,
+        global half  * src0_d,
+        global float * src1,
+        ulong offset1,
+        global float * dst,
+        ulong offsetd,
+        int ne00,
+        int ne01,
+        int ne02,
+        int ne10,
+        int ne12,
+        int ne0,
+        int ne1,
+        int r2,
+        int r3
+) {
+    src1 = (global float*)((global char*)src1 + offset1);
+    dst  = (global float*)((global char*)dst  + offsetd);
+
+    int row = get_global_id(0);
+    int col = get_global_id(1);
+    int im  = get_global_id(2);
+
+    if (row >= ne01 || col >= ne1) {
+        return;
+    }
+
+    int i12 = im % ne12;
+    int i13 = im / ne12;
+
+    const int nb = ne00 / QK4_0;
+    const int block_base = row * nb + (i12 / r2) * (nb * ne01) + (i13 / r3) * (nb * ne01 * ne02);
+
+    global uchar * q = src0_q + (ulong)block_base * (QK4_0/2);
+    global half  * d = src0_d + (ulong)block_base;
+
+    global float * y = src1 + col * ne10 + im * ne00 * ne1;
+
+    float acc = 0.0f;
+    for (int b = 0; b < nb; ++b) {
+        const float scale = vload_half(0, d + b);
+        global uchar * qblock = q + (ulong)b * (QK4_0/2);
+        const int y_off = b * QK4_0;
+        for (int j = 0; j < QK4_0/2; ++j) {
+            const uchar qb = qblock[j];
+            const int q0 = (int)(qb & 0x0F) - 8;
+            const int q1 = (int)(qb >> 4) - 8;
+            acc += (float)q0 * scale * y[y_off + j];
+            acc += (float)q1 * scale * y[y_off + j + QK4_0/2];
+        }
+    }
+
+    dst[col * ne0 + im * ne0 * ne1 + row] = acc;
+}

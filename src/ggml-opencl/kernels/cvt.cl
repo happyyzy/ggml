@@ -73,8 +73,15 @@ kernel void kernel_convert_block_q4_0(
     *d = b->d;
 
     for (int i = 0; i < QK4_0/2; ++i) {
-        q[i] = b->qs[i];
+        q[i] = convert_uchar(b->qs[i]);
     }
+
+#ifdef ADRENO_GPU
+    // Workaround for Adreno driver: keep a side-effect to avoid incorrect codegen.
+    if (get_global_id(0) == 65536*4096) {
+        printf("%04x - %02x\n", *(global ushort*)d, q[0]);
+    }
+#endif
 }
 
 kernel void kernel_restore_block_q4_0(
