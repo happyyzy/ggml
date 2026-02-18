@@ -4017,8 +4017,12 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
                 const double dt_ms = (ggml_time_us() - t0_us) * 1e-3;
                 op_ms["fused_norm_mul_add"] += dt_ms;
                 if (op_timing_detail) {
-                    GGML_LOG_INFO("ggml_opencl: op timing detail ms=%.3f op=fused_norm_mul_add name='%s' ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]\n",
-                                  dt_ms, node->name, node->ne[0], node->ne[1], node->ne[2], node->ne[3]);
+                    const ggml_tensor * src0 = node->src[0];
+                    const ggml_tensor * src1 = node->src[1];
+                    GGML_LOG_INFO("ggml_opencl: op timing detail ms=%.3f op=fused_norm_mul_add name='%s' ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] src0_ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] src1_ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]\n",
+                                  dt_ms, node->name, node->ne[0], node->ne[1], node->ne[2], node->ne[3],
+                                  src0 ? src0->ne[0] : -1, src0 ? src0->ne[1] : -1, src0 ? src0->ne[2] : -1, src0 ? src0->ne[3] : -1,
+                                  src1 ? src1->ne[0] : -1, src1 ? src1->ne[1] : -1, src1 ? src1->ne[2] : -1, src1 ? src1->ne[3] : -1);
                 }
             }
             i += 2;
@@ -4036,8 +4040,12 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
                 const double dt_ms = (ggml_time_us() - t0_us) * 1e-3;
                 op_ms["fused_group_norm_mul_add"] += dt_ms;
                 if (op_timing_detail) {
-                    GGML_LOG_INFO("ggml_opencl: op timing detail ms=%.3f op=fused_group_norm_mul_add name='%s' ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]\n",
-                                  dt_ms, node->name, node->ne[0], node->ne[1], node->ne[2], node->ne[3]);
+                    const ggml_tensor * src0 = node->src[0];
+                    const ggml_tensor * src1 = node->src[1];
+                    GGML_LOG_INFO("ggml_opencl: op timing detail ms=%.3f op=fused_group_norm_mul_add name='%s' ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] src0_ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] src1_ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]\n",
+                                  dt_ms, node->name, node->ne[0], node->ne[1], node->ne[2], node->ne[3],
+                                  src0 ? src0->ne[0] : -1, src0 ? src0->ne[1] : -1, src0 ? src0->ne[2] : -1, src0 ? src0->ne[3] : -1,
+                                  src1 ? src1->ne[0] : -1, src1 ? src1->ne[1] : -1, src1 ? src1->ne[2] : -1, src1 ? src1->ne[3] : -1);
                 }
             }
             i += 2;
@@ -4055,8 +4063,12 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
                 const double dt_ms = (ggml_time_us() - t0_us) * 1e-3;
                 op_ms["fused_rms_norm_mul"] += dt_ms;
                 if (op_timing_detail) {
-                    GGML_LOG_INFO("ggml_opencl: op timing detail ms=%.3f op=fused_rms_norm_mul name='%s' ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]\n",
-                                  dt_ms, node->name, node->ne[0], node->ne[1], node->ne[2], node->ne[3]);
+                    const ggml_tensor * src0 = node->src[0];
+                    const ggml_tensor * src1 = node->src[1];
+                    GGML_LOG_INFO("ggml_opencl: op timing detail ms=%.3f op=fused_rms_norm_mul name='%s' ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] src0_ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] src1_ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]\n",
+                                  dt_ms, node->name, node->ne[0], node->ne[1], node->ne[2], node->ne[3],
+                                  src0 ? src0->ne[0] : -1, src0 ? src0->ne[1] : -1, src0 ? src0->ne[2] : -1, src0 ? src0->ne[3] : -1,
+                                  src1 ? src1->ne[0] : -1, src1 ? src1->ne[1] : -1, src1 ? src1->ne[2] : -1, src1 ? src1->ne[3] : -1);
                 }
             }
             i++;
@@ -4074,9 +4086,13 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
             const double dt_ms = (ggml_time_us() - t0_us) * 1e-3;
             op_ms[ggml_op_name(node->op)] += dt_ms;
             if (op_timing_detail) {
-                GGML_LOG_INFO("ggml_opencl: op timing detail ms=%.3f op=%s name='%s' ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]\n",
+                const ggml_tensor * src0 = node->src[0];
+                const ggml_tensor * src1 = node->src[1];
+                GGML_LOG_INFO("ggml_opencl: op timing detail ms=%.3f op=%s name='%s' ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] src0_ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] src1_ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]\n",
                               dt_ms, ggml_op_name(node->op), node->name,
-                              node->ne[0], node->ne[1], node->ne[2], node->ne[3]);
+                              node->ne[0], node->ne[1], node->ne[2], node->ne[3],
+                              src0 ? src0->ne[0] : -1, src0 ? src0->ne[1] : -1, src0 ? src0->ne[2] : -1, src0 ? src0->ne[3] : -1,
+                              src1 ? src1->ne[0] : -1, src1 ? src1->ne[1] : -1, src1 ? src1->ne[2] : -1, src1 ? src1->ne[3] : -1);
             }
         }
         if (!ok) {
