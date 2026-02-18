@@ -3986,6 +3986,7 @@ static void ggml_opencl_op_group_norm_fused(ggml_backend_t backend, ggml_tensor 
 static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
     const bool op_timing = std::getenv("GGML_OPENCL_OP_TIMING") != nullptr;
+    const bool op_timing_detail = std::getenv("GGML_OPENCL_OP_TIMING_DETAIL") != nullptr;
     std::map<std::string, double> op_ms;
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -4013,7 +4014,12 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
             ggml_opencl_op_norm_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
             if (op_timing) {
                 CL_CHECK(clFinish(backend_ctx->queue));
-                op_ms["fused_norm_mul_add"] += (ggml_time_us() - t0_us) * 1e-3;
+                const double dt_ms = (ggml_time_us() - t0_us) * 1e-3;
+                op_ms["fused_norm_mul_add"] += dt_ms;
+                if (op_timing_detail) {
+                    GGML_LOG_INFO("ggml_opencl: op timing detail ms=%.3f op=fused_norm_mul_add name='%s' ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]\n",
+                                  dt_ms, node->name, node->ne[0], node->ne[1], node->ne[2], node->ne[3]);
+                }
             }
             i += 2;
             continue;
@@ -4027,7 +4033,12 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
             ggml_opencl_op_group_norm_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
             if (op_timing) {
                 CL_CHECK(clFinish(backend_ctx->queue));
-                op_ms["fused_group_norm_mul_add"] += (ggml_time_us() - t0_us) * 1e-3;
+                const double dt_ms = (ggml_time_us() - t0_us) * 1e-3;
+                op_ms["fused_group_norm_mul_add"] += dt_ms;
+                if (op_timing_detail) {
+                    GGML_LOG_INFO("ggml_opencl: op timing detail ms=%.3f op=fused_group_norm_mul_add name='%s' ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]\n",
+                                  dt_ms, node->name, node->ne[0], node->ne[1], node->ne[2], node->ne[3]);
+                }
             }
             i += 2;
             continue;
@@ -4041,7 +4052,12 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
             ggml_opencl_op_rms_norm_fused(backend, node, cgraph->nodes[i+1]);
             if (op_timing) {
                 CL_CHECK(clFinish(backend_ctx->queue));
-                op_ms["fused_rms_norm_mul"] += (ggml_time_us() - t0_us) * 1e-3;
+                const double dt_ms = (ggml_time_us() - t0_us) * 1e-3;
+                op_ms["fused_rms_norm_mul"] += dt_ms;
+                if (op_timing_detail) {
+                    GGML_LOG_INFO("ggml_opencl: op timing detail ms=%.3f op=fused_rms_norm_mul name='%s' ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]\n",
+                                  dt_ms, node->name, node->ne[0], node->ne[1], node->ne[2], node->ne[3]);
+                }
             }
             i++;
             continue;
@@ -4055,7 +4071,13 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
         bool ok = ggml_cl_compute_forward(backend, node);
         if (op_timing) {
             CL_CHECK(clFinish(backend_ctx->queue));
-            op_ms[ggml_op_name(node->op)] += (ggml_time_us() - t0_us) * 1e-3;
+            const double dt_ms = (ggml_time_us() - t0_us) * 1e-3;
+            op_ms[ggml_op_name(node->op)] += dt_ms;
+            if (op_timing_detail) {
+                GGML_LOG_INFO("ggml_opencl: op timing detail ms=%.3f op=%s name='%s' ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]\n",
+                              dt_ms, ggml_op_name(node->op), node->name,
+                              node->ne[0], node->ne[1], node->ne[2], node->ne[3]);
+            }
         }
         if (!ok) {
             GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
