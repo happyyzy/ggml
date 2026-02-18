@@ -644,8 +644,11 @@ struct ggml_backend_opencl_context {
     cl_program program_upscale;
     cl_program program_concat;
     cl_program program_conv_2d_f16;
+    cl_program program_conv_2d_f16_vae3x3;
     cl_program program_conv_2d_f32;
+    cl_program program_conv_2d_f32_vae3x3;
     cl_program program_conv_2d_f16_f32;
+    cl_program program_conv_2d_f16_f32_vae3x3;
     cl_program program_tsembd;
     cl_program program_gemv_moe_mxfp4_f32, program_gemm_moe_mxfp4_f32;
     cl_program program_mul_mv_id_q4_0_f32_8x_flat;
@@ -736,8 +739,11 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_concat_f32_contiguous;
     cl_kernel kernel_concat_f32_non_contiguous;
     cl_kernel kernel_conv_2d_f16;
+    cl_kernel kernel_conv_2d_f16_vae3x3;
     cl_kernel kernel_conv_2d_f32;
+    cl_kernel kernel_conv_2d_f32_vae3x3;
     cl_kernel kernel_conv_2d_f16_f32;
+    cl_kernel kernel_conv_2d_f16_f32_vae3x3;
     cl_kernel kernel_ssm_conv_f32_f32, kernel_ssm_conv_f32_f32_4;
     cl_kernel kernel_timestep_embedding;
     cl_kernel kernel_gemv_moe_mxfp4_f32, kernel_gemm_moe_mxfp4_f32;
@@ -2690,45 +2696,89 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
         GGML_LOG_CONT(".");
     }
 
-     // conv2d
-     {
-        #ifdef GGML_OPENCL_EMBED_KERNELS
-                const std::string kernel_src {
-                    #include "conv2d.cl.h"
-                };
-                const std::string kernel_src_f16_f32 {
-                    #include "conv2d_f16_f32.cl.h"
-                };
-        #else
-                const std::string kernel_src = read_file("conv2d.cl");
-                const std::string kernel_src_f16_f32 = read_file("conv2d_f16_f32.cl");
-        #endif
-                if (!kernel_src.empty()) {
-                    backend_ctx->program_conv_2d_f16 =
-                        build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), (std::string(compile_opts) + " -DUSE_FP16=1").c_str());
-                    CL_CHECK((backend_ctx->kernel_conv_2d_f16 = clCreateKernel(backend_ctx->program_conv_2d_f16, "kernel_conv_2d", &err), err));
-                    GGML_LOG_CONT(".");
-                    backend_ctx->program_conv_2d_f32 =
-                        build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
-                    CL_CHECK((backend_ctx->kernel_conv_2d_f32 = clCreateKernel(backend_ctx->program_conv_2d_f32, "kernel_conv_2d", &err), err));
-                    GGML_LOG_CONT(".");
-                } else {
-                    GGML_LOG_WARN("ggml_opencl: conv2d kernel source not found or empty. This op will not be available.\n");
-                    backend_ctx->program_conv_2d_f16 = nullptr;
-                    backend_ctx->kernel_conv_2d_f16 = nullptr;
-                    backend_ctx->program_conv_2d_f32 = nullptr;
-                    backend_ctx->kernel_conv_2d_f32 = nullptr;
-                }
-                if (!kernel_src_f16_f32.empty()) {
-                    backend_ctx->program_conv_2d_f16_f32 =
-                        build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src_f16_f32.c_str(), compile_opts);
-                    CL_CHECK((backend_ctx->kernel_conv_2d_f16_f32 = clCreateKernel(backend_ctx->program_conv_2d_f16_f32, "kernel_conv_2d", &err), err));
-                    GGML_LOG_CONT(".");
-                } else {
-                    GGML_LOG_WARN("ggml_opencl: conv2d_f16_f32 kernel source not found or empty. This op will not be available.\n");
-                    backend_ctx->program_conv_2d_f16_f32 = nullptr;
-                    backend_ctx->kernel_conv_2d_f16_f32 = nullptr;
-                }
+    // conv2d
+    {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "conv2d.cl.h"
+        };
+        const std::string kernel_src_f16_f32 {
+            #include "conv2d_f16_f32.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("conv2d.cl");
+        const std::string kernel_src_f16_f32 = read_file("conv2d_f16_f32.cl");
+#endif
+        const bool use_conv2d_qcom_accel16 = std::getenv("GGML_OPENCL_CONV2D_QCOM_ACCEL16") != nullptr &&
+                                             backend_ctx->gpu_family == GPU_FAMILY::ADRENO;
+        if (use_conv2d_qcom_accel16) {
+            GGML_LOG_INFO("ggml_opencl: conv2d qcom accel16 enabled\n");
+        }
+
+        if (!kernel_src.empty()) {
+            std::string conv2d_opts_f16 = std::string(compile_opts) + " -DUSE_FP16=1";
+            if (use_conv2d_qcom_accel16) {
+                conv2d_opts_f16 += " -qcom-accelerate-16-bit";
+            }
+
+            backend_ctx->program_conv_2d_f16 =
+                build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), conv2d_opts_f16.c_str());
+            CL_CHECK((backend_ctx->kernel_conv_2d_f16 = clCreateKernel(backend_ctx->program_conv_2d_f16, "kernel_conv_2d", &err), err));
+            GGML_LOG_CONT(".");
+
+            // Tuned variant for VAE hot path (3x3, stride1, pad1, N=1, Cin=Cout in {128,256,512}).
+            std::string conv2d_opts_f16_vae3x3 =
+                conv2d_opts_f16 + " -DGGML_CONV2D_BS_CRS=32 -DGGML_CONV2D_BS_NPQ=128";
+            backend_ctx->program_conv_2d_f16_vae3x3 =
+                build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), conv2d_opts_f16_vae3x3.c_str());
+            CL_CHECK((backend_ctx->kernel_conv_2d_f16_vae3x3 = clCreateKernel(backend_ctx->program_conv_2d_f16_vae3x3, "kernel_conv_2d", &err), err));
+            GGML_LOG_CONT(".");
+
+            backend_ctx->program_conv_2d_f32 =
+                build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
+            CL_CHECK((backend_ctx->kernel_conv_2d_f32 = clCreateKernel(backend_ctx->program_conv_2d_f32, "kernel_conv_2d", &err), err));
+            GGML_LOG_CONT(".");
+
+            std::string conv2d_opts_f32_vae3x3 =
+                std::string(compile_opts) + " -DGGML_CONV2D_BS_CRS=32 -DGGML_CONV2D_BS_NPQ=128";
+            backend_ctx->program_conv_2d_f32_vae3x3 =
+                build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), conv2d_opts_f32_vae3x3.c_str());
+            CL_CHECK((backend_ctx->kernel_conv_2d_f32_vae3x3 = clCreateKernel(backend_ctx->program_conv_2d_f32_vae3x3, "kernel_conv_2d", &err), err));
+            GGML_LOG_CONT(".");
+        } else {
+            GGML_LOG_WARN("ggml_opencl: conv2d kernel source not found or empty. This op will not be available.\n");
+            backend_ctx->program_conv_2d_f16 = nullptr;
+            backend_ctx->kernel_conv_2d_f16 = nullptr;
+            backend_ctx->program_conv_2d_f16_vae3x3 = nullptr;
+            backend_ctx->kernel_conv_2d_f16_vae3x3 = nullptr;
+            backend_ctx->program_conv_2d_f32 = nullptr;
+            backend_ctx->kernel_conv_2d_f32 = nullptr;
+            backend_ctx->program_conv_2d_f32_vae3x3 = nullptr;
+            backend_ctx->kernel_conv_2d_f32_vae3x3 = nullptr;
+        }
+        if (!kernel_src_f16_f32.empty()) {
+            std::string conv2d_opts_f16_f32 = std::string(compile_opts);
+            if (use_conv2d_qcom_accel16) {
+                conv2d_opts_f16_f32 += " -qcom-accelerate-16-bit";
+            }
+            backend_ctx->program_conv_2d_f16_f32 =
+                build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src_f16_f32.c_str(), conv2d_opts_f16_f32.c_str());
+            CL_CHECK((backend_ctx->kernel_conv_2d_f16_f32 = clCreateKernel(backend_ctx->program_conv_2d_f16_f32, "kernel_conv_2d", &err), err));
+            GGML_LOG_CONT(".");
+
+            std::string conv2d_opts_f16_f32_vae3x3 =
+                conv2d_opts_f16_f32 + " -DGGML_CONV2D_BS_CRS=32 -DGGML_CONV2D_BS_NPQ=128";
+            backend_ctx->program_conv_2d_f16_f32_vae3x3 =
+                build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src_f16_f32.c_str(), conv2d_opts_f16_f32_vae3x3.c_str());
+            CL_CHECK((backend_ctx->kernel_conv_2d_f16_f32_vae3x3 = clCreateKernel(backend_ctx->program_conv_2d_f16_f32_vae3x3, "kernel_conv_2d", &err), err));
+            GGML_LOG_CONT(".");
+        } else {
+            GGML_LOG_WARN("ggml_opencl: conv2d_f16_f32 kernel source not found or empty. This op will not be available.\n");
+            backend_ctx->program_conv_2d_f16_f32 = nullptr;
+            backend_ctx->kernel_conv_2d_f16_f32 = nullptr;
+            backend_ctx->program_conv_2d_f16_f32_vae3x3 = nullptr;
+            backend_ctx->kernel_conv_2d_f16_f32_vae3x3 = nullptr;
+        }
     }
 
     // ssm_conv
@@ -4088,8 +4138,11 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
             if (op_timing_detail) {
                 const ggml_tensor * src0 = node->src[0];
                 const ggml_tensor * src1 = node->src[1];
-                GGML_LOG_INFO("ggml_opencl: op timing detail ms=%.3f op=%s name='%s' ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] src0_ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] src1_ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]\n",
+                GGML_LOG_INFO("ggml_opencl: op timing detail ms=%.3f op=%s name='%s' dst_type=%s src0_type=%s src1_type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] src0_ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] src1_ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]\n",
                               dt_ms, ggml_op_name(node->op), node->name,
+                              ggml_type_name(node->type),
+                              src0 ? ggml_type_name(src0->type) : "nil",
+                              src1 ? ggml_type_name(src1->type) : "nil",
                               node->ne[0], node->ne[1], node->ne[2], node->ne[3],
                               src0 ? src0->ne[0] : -1, src0 ? src0->ne[1] : -1, src0 ? src0->ne[2] : -1, src0 ? src0->ne[3] : -1,
                               src1 ? src1->ne[0] : -1, src1 ? src1->ne[1] : -1, src1 ? src1->ne[2] : -1, src1 ? src1->ne[3] : -1);
@@ -10374,32 +10427,88 @@ static void ggml_cl_conv_2d(ggml_backend_t backend, const ggml_tensor * src0, co
 
     const int64_t NPQ = (int64_t)N * OW * OH;
 
-    const uint32_t BS_K = 64;
-    const uint32_t BS_NPQ = 64;
-    const uint32_t BS_CRS = 16;
+    uint32_t BS_K = 64;
+    uint32_t BS_NPQ = 64;
+    uint32_t BS_CRS = 16;
     const uint32_t VEC_SIZE = 4;
 
-    const uint32_t TS_K = 4;
-    const uint32_t TS_NPQ = 8;
-
-    const uint32_t WG_K = BS_K / TS_K;
-    const uint32_t WG_NPQ = BS_NPQ / TS_NPQ;
+    uint32_t TS_K = 4;
+    uint32_t TS_NPQ = 8;
 
     auto splitWork = [](uint32_t work_size, uint32_t block_size) { return (block_size + work_size - 1) / block_size; };
-    const uint32_t NB_K = splitWork(Cout, BS_K);
-    const uint32_t NB_NPQ = splitWork(NPQ, BS_NPQ);
 
     cl_kernel kernel;
     size_t shmem_size;
 
+    const bool is_vae3x3_hotshape =
+        KW == 3 && KH == 3 &&
+        s0 == 1 && s1 == 1 &&
+        p0 == 1 && p1 == 1 &&
+        d0 == 1 && d1 == 1 &&
+        N == 1 &&
+        Cin == Cout &&
+        (Cin == 128 || Cin == 256 || Cin == 512);
+    const bool enable_conv2d_tuned = std::getenv("GGML_OPENCL_CONV2D_TUNED") != nullptr;
+
+    const bool use_vae3x3_tuned_f16 =
+        enable_conv2d_tuned &&
+        src0->type == GGML_TYPE_F16 &&
+        src1->type == GGML_TYPE_F16 &&
+        backend_ctx->kernel_conv_2d_f16_vae3x3 != nullptr &&
+        is_vae3x3_hotshape;
+
+    const bool use_vae3x3_tuned_f32 =
+        enable_conv2d_tuned &&
+        src0->type == GGML_TYPE_F32 &&
+        src1->type == GGML_TYPE_F32 &&
+        backend_ctx->kernel_conv_2d_f32_vae3x3 != nullptr &&
+        is_vae3x3_hotshape;
+
+    const bool use_vae3x3_tuned_f16_f32 =
+        enable_conv2d_tuned &&
+        src0->type == GGML_TYPE_F16 &&
+        src1->type == GGML_TYPE_F32 &&
+        backend_ctx->kernel_conv_2d_f16_f32_vae3x3 != nullptr &&
+        is_vae3x3_hotshape;
+
+    if (std::getenv("GGML_OPENCL_CONV2D_TUNED_LOG") != nullptr) {
+        static bool logged_tuned_f16 = false;
+        static bool logged_tuned_f32 = false;
+        static bool logged_tuned_f16_f32 = false;
+        if (use_vae3x3_tuned_f16 && !logged_tuned_f16) {
+            GGML_LOG_INFO("ggml_opencl: conv2d tuned f16 kernel active (Cin=%u, OW=%u, OH=%u)\n", Cin, OW, OH);
+            logged_tuned_f16 = true;
+        }
+        if (use_vae3x3_tuned_f32 && !logged_tuned_f32) {
+            GGML_LOG_INFO("ggml_opencl: conv2d tuned f32 kernel active (Cin=%u, OW=%u, OH=%u)\n", Cin, OW, OH);
+            logged_tuned_f32 = true;
+        }
+        if (use_vae3x3_tuned_f16_f32 && !logged_tuned_f16_f32) {
+            GGML_LOG_INFO("ggml_opencl: conv2d tuned f16_f32 kernel active (Cin=%u, OW=%u, OH=%u)\n", Cin, OW, OH);
+            logged_tuned_f16_f32 = true;
+        }
+    }
+
+    if (use_vae3x3_tuned_f16 || use_vae3x3_tuned_f32 || use_vae3x3_tuned_f16_f32) {
+        BS_CRS = 32;
+        BS_NPQ = 128;
+        TS_K = 4;
+        TS_NPQ = 8;
+    }
+
+    const uint32_t WG_K = BS_K / TS_K;
+    const uint32_t WG_NPQ = BS_NPQ / TS_NPQ;
+    const uint32_t NB_K = splitWork(Cout, BS_K);
+    const uint32_t NB_NPQ = splitWork((uint32_t) NPQ, BS_NPQ);
+
     if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F16) {
-        kernel = backend_ctx->kernel_conv_2d_f16;
+        kernel = use_vae3x3_tuned_f16 ? backend_ctx->kernel_conv_2d_f16_vae3x3 : backend_ctx->kernel_conv_2d_f16;
         shmem_size = (size_t)(BS_K * BS_CRS * sizeof(cl_half) + BS_CRS * (BS_NPQ / VEC_SIZE) * sizeof(cl_half4));
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) {
-        kernel = backend_ctx->kernel_conv_2d_f32;
+        kernel = use_vae3x3_tuned_f32 ? backend_ctx->kernel_conv_2d_f32_vae3x3 : backend_ctx->kernel_conv_2d_f32;
         shmem_size = (size_t)(BS_K * BS_CRS * sizeof(cl_float) + BS_CRS * (BS_NPQ / VEC_SIZE) * sizeof(cl_float4));
     } else if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F32) {
-        kernel = backend_ctx->kernel_conv_2d_f16_f32;
+        kernel = use_vae3x3_tuned_f16_f32 ? backend_ctx->kernel_conv_2d_f16_f32_vae3x3 : backend_ctx->kernel_conv_2d_f16_f32;
         shmem_size = (size_t)(BS_K * BS_CRS * sizeof(cl_half) + BS_CRS * (BS_NPQ / VEC_SIZE) * sizeof(cl_float4));
     } else {
         GGML_ASSERT(false && "Unsupported data type combination for conv2d");

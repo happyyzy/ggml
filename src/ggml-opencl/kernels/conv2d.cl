@@ -19,12 +19,35 @@
 #define T_ACCUM float4
 #define VEC_SIZE 4
 
+#ifndef GGML_CONV2D_BS_K
 #define BS_K 64
-#define BS_NPQ 64
-#define BS_CRS 16
+#else
+#define BS_K GGML_CONV2D_BS_K
+#endif
 
+#ifndef GGML_CONV2D_BS_NPQ
+#define BS_NPQ 64
+#else
+#define BS_NPQ GGML_CONV2D_BS_NPQ
+#endif
+
+#ifndef GGML_CONV2D_BS_CRS
+#define BS_CRS 16
+#else
+#define BS_CRS GGML_CONV2D_BS_CRS
+#endif
+
+#ifndef GGML_CONV2D_TS_K
 #define TS_K 4
+#else
+#define TS_K GGML_CONV2D_TS_K
+#endif
+
+#ifndef GGML_CONV2D_TS_NPQ
 #define TS_NPQ 8
+#else
+#define TS_NPQ GGML_CONV2D_TS_NPQ
+#endif
 
 #define WG_K (BS_K / TS_K)
 #define WG_NPQ (BS_NPQ / TS_NPQ)
