@@ -873,6 +873,11 @@ struct ggml_backend_opencl_context {
     cl_program program_CL_gemm;
     cl_program program_CL_gemm_kahan;
     cl_program program_CL_gemm_f32act;
+    cl_program program_CL_gemm_f32read;
+    cl_program program_CL_gemm_f32acc;
+    cl_program program_CL_gemm_halfclamp;
+    cl_program program_CL_gemm_halfscale;
+    cl_program program_CL_gemm_fp16chunk;
     cl_program program_CL_gemv_general;
     cl_program program_CL_gemv_4096_1_11008;
     cl_program program_CL_gemv_4096_1_4096;
@@ -881,6 +886,11 @@ struct ggml_backend_opencl_context {
     cl_kernel CL_mul_mat_Ab_Bi_8x4;
     cl_kernel CL_mul_mat_Ab_Bi_8x4_kahan;
     cl_kernel CL_mul_mat_Ab_Bi_8x4_f32act;
+    cl_kernel CL_mul_mat_Ab_Bi_8x4_f32read;
+    cl_kernel CL_mul_mat_Ab_Bi_8x4_f32acc;
+    cl_kernel CL_mul_mat_Ab_Bi_8x4_halfclamp;
+    cl_kernel CL_mul_mat_Ab_Bi_8x4_halfscale;
+    cl_kernel CL_mul_mat_Ab_Bi_8x4_fp16chunk;
     cl_kernel CL_mul_mat_vec_q4_0_f32_1d_4x_flat_general;
     cl_kernel CL_mul_mat_vec_q4_0_f32_1d_4x_flat_4096_1_11008;
     cl_kernel CL_mul_mat_vec_q4_0_f32_1d_4x_flat_4096_1_4096;
@@ -2961,6 +2971,32 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
             !global_kahan_q4_gemm && (std::getenv("SD_OCL_Q4_GEMM_KAHAN_SUBSTR") != nullptr);
         const bool global_f32_act_q4_gemm = std::getenv("SD_OCL_Q4_GEMM_F32_ACT") != nullptr;
         const bool selective_f32_act_q4_gemm = !global_f32_act_q4_gemm;
+        const bool global_f32_acc_q4_gemm = std::getenv("SD_OCL_Q4_GEMM_F32_ACC") != nullptr;
+        const bool selective_f32_acc_q4_gemm =
+            !global_f32_acc_q4_gemm && (std::getenv("SD_OCL_Q4_GEMM_F32_ACC_SUBSTR") != nullptr);
+        const bool global_f32_read_q4_gemm = std::getenv("SD_OCL_Q4_GEMM_F32_READ") != nullptr;
+        const bool selective_f32_read_q4_gemm =
+            !global_f32_read_q4_gemm && (std::getenv("SD_OCL_Q4_GEMM_F32_READ_SUBSTR") != nullptr);
+        const bool global_half_acc_clamp_q4_gemm = std::getenv("SD_OCL_Q4_GEMM_HALF_ACC_CLAMP") != nullptr;
+        const bool selective_half_acc_clamp_q4_gemm =
+            !global_half_acc_clamp_q4_gemm && (std::getenv("SD_OCL_Q4_GEMM_HALF_ACC_CLAMP_SUBSTR") != nullptr);
+        const bool global_half_scale_q4_gemm = std::getenv("SD_OCL_Q4_GEMM_HALF_SCALE") != nullptr;
+        const bool selective_half_scale_q4_gemm =
+            !global_half_scale_q4_gemm && (std::getenv("SD_OCL_Q4_GEMM_HALF_SCALE_SUBSTR") != nullptr);
+        const bool global_fp16_chunk_acc_q4_gemm = std::getenv("SD_OCL_Q4_GEMM_FP16_CHUNK_ACC") != nullptr;
+        const bool selective_fp16_chunk_acc_q4_gemm =
+            !global_fp16_chunk_acc_q4_gemm && (std::getenv("SD_OCL_Q4_GEMM_FP16_CHUNK_ACC_SUBSTR") != nullptr);
+        const auto append_half_scale_opts = [](std::string & opts) {
+            opts += " -DUSE_HALF_SCALE_ACC=1";
+            float scale = 0.5f;
+            if (const char * scale_env = std::getenv("SD_OCL_Q4_GEMM_HALF_SCALE_VALUE")) {
+                const float parsed = std::atof(scale_env);
+                if (parsed > 0.0f && parsed < 1.0f) {
+                    scale = parsed;
+                }
+            }
+            opts += " -DHALF_SCALE_ACC_F=" + std::to_string(scale);
+        };
 
         std::string gemm_compile_opts = precise_q4_gemm ? compile_opts_precise : compile_opts;
         if (global_kahan_q4_gemm) {
@@ -2970,6 +3006,26 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
         if (global_f32_act_q4_gemm) {
             GGML_LOG_INFO("ggml_opencl: full-f32 activation reads enabled for q4 gemm kernel\n");
             gemm_compile_opts += " -DUSE_F32_ACT=1";
+        }
+        if (global_f32_acc_q4_gemm) {
+            GGML_LOG_INFO("ggml_opencl: fp32 accumulation enabled for q4 gemm kernel\n");
+            gemm_compile_opts += " -DUSE_F32_ACC=1";
+        }
+        if (global_f32_read_q4_gemm) {
+            GGML_LOG_INFO("ggml_opencl: f32 activation-read enabled for q4 gemm kernel\n");
+            gemm_compile_opts += " -DUSE_F32_READ=1";
+        }
+        if (global_half_acc_clamp_q4_gemm) {
+            GGML_LOG_INFO("ggml_opencl: half-acc clamp enabled for q4 gemm kernel\n");
+            gemm_compile_opts += " -DUSE_HALF_ACC_CLAMP=1";
+        }
+        if (global_half_scale_q4_gemm) {
+            GGML_LOG_INFO("ggml_opencl: half-acc contribution scaling enabled for q4 gemm kernel\n");
+            append_half_scale_opts(gemm_compile_opts);
+        }
+        if (global_fp16_chunk_acc_q4_gemm) {
+            GGML_LOG_INFO("ggml_opencl: fp16 chunk-acc enabled for q4 gemm kernel\n");
+            gemm_compile_opts += " -DUSE_FP16_CHUNK_ACC=1";
         }
 
         backend_ctx->program_CL_gemm =
@@ -2997,6 +3053,68 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
                 build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src_CL_gemm.c_str(), gemm_compile_opts_f32act);
             CL_CHECK((backend_ctx->CL_mul_mat_Ab_Bi_8x4_f32act =
                 clCreateKernel(backend_ctx->program_CL_gemm_f32act, "kernel_mul_mat_Ab_Bi_8x4", &err), err));
+        }
+
+        backend_ctx->program_CL_gemm_f32acc = nullptr;
+        backend_ctx->CL_mul_mat_Ab_Bi_8x4_f32acc = nullptr;
+        if (selective_f32_acc_q4_gemm) {
+            GGML_LOG_INFO("ggml_opencl: selective fp32 accumulation enabled for q4 gemm kernel\n");
+            std::string gemm_compile_opts_f32acc = gemm_compile_opts + " -DUSE_F32_ACC=1";
+            backend_ctx->program_CL_gemm_f32acc =
+                build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src_CL_gemm.c_str(), gemm_compile_opts_f32acc);
+            CL_CHECK((backend_ctx->CL_mul_mat_Ab_Bi_8x4_f32acc =
+                clCreateKernel(backend_ctx->program_CL_gemm_f32acc, "kernel_mul_mat_Ab_Bi_8x4", &err), err));
+        }
+
+        backend_ctx->program_CL_gemm_f32read = nullptr;
+        backend_ctx->CL_mul_mat_Ab_Bi_8x4_f32read = nullptr;
+        if (selective_f32_read_q4_gemm) {
+            GGML_LOG_INFO("ggml_opencl: selective f32 activation-read enabled for q4 gemm kernel\n");
+            std::string gemm_compile_opts_f32read = gemm_compile_opts + " -DUSE_F32_READ=1";
+            backend_ctx->program_CL_gemm_f32read =
+                build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src_CL_gemm.c_str(), gemm_compile_opts_f32read);
+            CL_CHECK((backend_ctx->CL_mul_mat_Ab_Bi_8x4_f32read =
+                clCreateKernel(backend_ctx->program_CL_gemm_f32read, "kernel_mul_mat_Ab_Bi_8x4", &err), err));
+        }
+
+        backend_ctx->program_CL_gemm_halfclamp = nullptr;
+        backend_ctx->CL_mul_mat_Ab_Bi_8x4_halfclamp = nullptr;
+        if (selective_half_acc_clamp_q4_gemm) {
+            GGML_LOG_INFO("ggml_opencl: selective half-acc clamp enabled for q4 gemm kernel\n");
+            std::string gemm_compile_opts_halfclamp = gemm_compile_opts + " -DUSE_HALF_ACC_CLAMP=1";
+            backend_ctx->program_CL_gemm_halfclamp =
+                build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src_CL_gemm.c_str(), gemm_compile_opts_halfclamp);
+            CL_CHECK((backend_ctx->CL_mul_mat_Ab_Bi_8x4_halfclamp =
+                clCreateKernel(backend_ctx->program_CL_gemm_halfclamp, "kernel_mul_mat_Ab_Bi_8x4", &err), err));
+        }
+
+        backend_ctx->program_CL_gemm_halfscale = nullptr;
+        backend_ctx->CL_mul_mat_Ab_Bi_8x4_halfscale = nullptr;
+        if (selective_half_scale_q4_gemm) {
+            GGML_LOG_INFO("ggml_opencl: selective half-acc contribution scaling enabled for q4 gemm kernel\n");
+            std::string gemm_compile_opts_halfscale = gemm_compile_opts;
+            append_half_scale_opts(gemm_compile_opts_halfscale);
+            backend_ctx->program_CL_gemm_halfscale =
+                build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src_CL_gemm.c_str(), gemm_compile_opts_halfscale);
+            CL_CHECK((backend_ctx->CL_mul_mat_Ab_Bi_8x4_halfscale =
+                clCreateKernel(backend_ctx->program_CL_gemm_halfscale, "kernel_mul_mat_Ab_Bi_8x4", &err), err));
+        }
+
+        backend_ctx->program_CL_gemm_fp16chunk = nullptr;
+        backend_ctx->CL_mul_mat_Ab_Bi_8x4_fp16chunk = nullptr;
+        if (selective_fp16_chunk_acc_q4_gemm) {
+            GGML_LOG_INFO("ggml_opencl: selective fp16 chunk-acc enabled for q4 gemm kernel\n");
+            std::string gemm_compile_opts_fp16chunk = gemm_compile_opts + " -DUSE_FP16_CHUNK_ACC=1";
+            if (const char * chunk_iters_env = std::getenv("SD_OCL_Q4_GEMM_FP16_CHUNK_ITERS")) {
+                int chunk_iters = std::atoi(chunk_iters_env);
+                if (chunk_iters > 0) {
+                    gemm_compile_opts_fp16chunk += " -DCHUNK_ACC_ITERS=" + std::to_string(chunk_iters);
+                }
+            }
+            backend_ctx->program_CL_gemm_fp16chunk =
+                build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src_CL_gemm.c_str(), gemm_compile_opts_fp16chunk);
+            CL_CHECK((backend_ctx->CL_mul_mat_Ab_Bi_8x4_fp16chunk =
+                clCreateKernel(backend_ctx->program_CL_gemm_fp16chunk, "kernel_mul_mat_Ab_Bi_8x4", &err), err));
         }
         GGML_LOG_CONT(".");
     }
@@ -4795,6 +4913,196 @@ static inline bool ggml_opencl_force_f32_act_gemm(const ggml_tensor * tensor) {
         }
     }
 
+    return false;
+}
+
+static inline bool ggml_opencl_force_f32_acc_gemm(const ggml_tensor * tensor) {
+    if (tensor == nullptr) {
+        return false;
+    }
+    const char * name = tensor->name;
+    if (name == nullptr || name[0] == '\0') {
+        return false;
+    }
+    const char * pats = std::getenv("SD_OCL_Q4_GEMM_F32_ACC_SUBSTR");
+    if (pats == nullptr || pats[0] == '\0') {
+        return false;
+    }
+    std::string s(pats);
+    size_t start = 0;
+    while (start < s.size()) {
+        size_t end = s.find(',', start);
+        if (end == std::string::npos) {
+            end = s.size();
+        }
+        size_t l = start;
+        size_t r = end;
+        while (l < r && std::isspace(static_cast<unsigned char>(s[l]))) {
+            ++l;
+        }
+        while (r > l && std::isspace(static_cast<unsigned char>(s[r - 1]))) {
+            --r;
+        }
+        if (r > l) {
+            std::string tok = s.substr(l, r - l);
+            if (std::strstr(name, tok.c_str()) != nullptr) {
+                return true;
+            }
+        }
+        start = end + 1;
+    }
+    return false;
+}
+
+static inline bool ggml_opencl_force_f32_read_gemm(const ggml_tensor * tensor) {
+    if (tensor == nullptr) {
+        return false;
+    }
+    const char * name = tensor->name;
+    if (name == nullptr || name[0] == '\0') {
+        return false;
+    }
+    const char * pats = std::getenv("SD_OCL_Q4_GEMM_F32_READ_SUBSTR");
+    if (pats == nullptr || pats[0] == '\0') {
+        return false;
+    }
+    std::string s(pats);
+    size_t start = 0;
+    while (start < s.size()) {
+        size_t end = s.find(',', start);
+        if (end == std::string::npos) {
+            end = s.size();
+        }
+        size_t l = start;
+        size_t r = end;
+        while (l < r && std::isspace(static_cast<unsigned char>(s[l]))) {
+            ++l;
+        }
+        while (r > l && std::isspace(static_cast<unsigned char>(s[r - 1]))) {
+            --r;
+        }
+        if (r > l) {
+            std::string tok = s.substr(l, r - l);
+            if (std::strstr(name, tok.c_str()) != nullptr) {
+                return true;
+            }
+        }
+        start = end + 1;
+    }
+    return false;
+}
+
+static inline bool ggml_opencl_force_half_acc_clamp_gemm(const ggml_tensor * tensor) {
+    if (tensor == nullptr) {
+        return false;
+    }
+    const char * name = tensor->name;
+    if (name == nullptr || name[0] == '\0') {
+        return false;
+    }
+    const char * pats = std::getenv("SD_OCL_Q4_GEMM_HALF_ACC_CLAMP_SUBSTR");
+    if (pats == nullptr || pats[0] == '\0') {
+        return false;
+    }
+    std::string s(pats);
+    size_t start = 0;
+    while (start < s.size()) {
+        size_t end = s.find(',', start);
+        if (end == std::string::npos) {
+            end = s.size();
+        }
+        size_t l = start;
+        size_t r = end;
+        while (l < r && std::isspace(static_cast<unsigned char>(s[l]))) {
+            ++l;
+        }
+        while (r > l && std::isspace(static_cast<unsigned char>(s[r - 1]))) {
+            --r;
+        }
+        if (r > l) {
+            std::string tok = s.substr(l, r - l);
+            if (std::strstr(name, tok.c_str()) != nullptr) {
+                return true;
+            }
+        }
+        start = end + 1;
+    }
+    return false;
+}
+
+static inline bool ggml_opencl_force_half_scale_gemm(const ggml_tensor * tensor) {
+    if (tensor == nullptr) {
+        return false;
+    }
+    const char * name = tensor->name;
+    if (name == nullptr || name[0] == '\0') {
+        return false;
+    }
+    const char * pats = std::getenv("SD_OCL_Q4_GEMM_HALF_SCALE_SUBSTR");
+    if (pats == nullptr || pats[0] == '\0') {
+        return false;
+    }
+    std::string s(pats);
+    size_t start = 0;
+    while (start < s.size()) {
+        size_t end = s.find(',', start);
+        if (end == std::string::npos) {
+            end = s.size();
+        }
+        size_t l = start;
+        size_t r = end;
+        while (l < r && std::isspace(static_cast<unsigned char>(s[l]))) {
+            ++l;
+        }
+        while (r > l && std::isspace(static_cast<unsigned char>(s[r - 1]))) {
+            --r;
+        }
+        if (r > l) {
+            std::string tok = s.substr(l, r - l);
+            if (std::strstr(name, tok.c_str()) != nullptr) {
+                return true;
+            }
+        }
+        start = end + 1;
+    }
+    return false;
+}
+
+static inline bool ggml_opencl_force_fp16_chunk_acc_gemm(const ggml_tensor * tensor) {
+    if (tensor == nullptr) {
+        return false;
+    }
+    const char * name = tensor->name;
+    if (name == nullptr || name[0] == '\0') {
+        return false;
+    }
+    const char * pats = std::getenv("SD_OCL_Q4_GEMM_FP16_CHUNK_ACC_SUBSTR");
+    if (pats == nullptr || pats[0] == '\0') {
+        return false;
+    }
+    std::string s(pats);
+    size_t start = 0;
+    while (start < s.size()) {
+        size_t end = s.find(',', start);
+        if (end == std::string::npos) {
+            end = s.size();
+        }
+        size_t l = start;
+        size_t r = end;
+        while (l < r && std::isspace(static_cast<unsigned char>(s[l]))) {
+            ++l;
+        }
+        while (r > l && std::isspace(static_cast<unsigned char>(s[r - 1]))) {
+            --r;
+        }
+        if (r > l) {
+            std::string tok = s.substr(l, r - l);
+            if (std::strstr(name, tok.c_str()) != nullptr) {
+                return true;
+            }
+        }
+        start = end + 1;
+    }
     return false;
 }
 
@@ -10569,6 +10877,21 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             }
         } else {
             kernel = backend_ctx->CL_mul_mat_Ab_Bi_8x4;
+            if (backend_ctx->CL_mul_mat_Ab_Bi_8x4_fp16chunk != nullptr && ggml_opencl_force_fp16_chunk_acc_gemm(src0)) {
+                kernel = backend_ctx->CL_mul_mat_Ab_Bi_8x4_fp16chunk;
+            }
+            if (backend_ctx->CL_mul_mat_Ab_Bi_8x4_halfscale != nullptr && ggml_opencl_force_half_scale_gemm(src0)) {
+                kernel = backend_ctx->CL_mul_mat_Ab_Bi_8x4_halfscale;
+            }
+            if (backend_ctx->CL_mul_mat_Ab_Bi_8x4_halfclamp != nullptr && ggml_opencl_force_half_acc_clamp_gemm(src0)) {
+                kernel = backend_ctx->CL_mul_mat_Ab_Bi_8x4_halfclamp;
+            }
+            if (backend_ctx->CL_mul_mat_Ab_Bi_8x4_f32acc != nullptr && ggml_opencl_force_f32_acc_gemm(src0)) {
+                kernel = backend_ctx->CL_mul_mat_Ab_Bi_8x4_f32acc;
+            }
+            if (backend_ctx->CL_mul_mat_Ab_Bi_8x4_f32read != nullptr && ggml_opencl_force_f32_read_gemm(src0)) {
+                kernel = backend_ctx->CL_mul_mat_Ab_Bi_8x4_f32read;
+            }
             if (backend_ctx->CL_mul_mat_Ab_Bi_8x4_f32act != nullptr && ggml_opencl_force_f32_act_gemm(src0)) {
                 kernel = backend_ctx->CL_mul_mat_Ab_Bi_8x4_f32act;
             }

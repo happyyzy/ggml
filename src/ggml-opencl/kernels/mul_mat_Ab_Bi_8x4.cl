@@ -27,12 +27,14 @@ kernel void kernel_mul_mat_Ab_Bi_8x4(
         int k,                              // K
         int n_no_padding                    // N without padding
 ) {
-#if defined(USE_KAHAN_ACC) || defined(USE_F32_ACT)
+#if defined(USE_KAHAN_ACC) || defined(USE_F32_ACT) || defined(USE_F32_ACC)
 #define ACCUM_FP32 1
 #endif
 
 #ifdef USE_F32_ACT
 #define READ_ACT4(img, idx) read_imagef((img), (idx))
+#elif defined(USE_F32_READ)
+#define READ_ACT4(img, idx) convert_half4_rte(read_imagef((img), (idx)))
 #elif defined(ACCUM_FP32)
 #define READ_ACT4(img, idx) convert_float4(read_imageh((img), (idx)))
 #else
@@ -43,6 +45,14 @@ kernel void kernel_mul_mat_Ab_Bi_8x4(
 #define SCALE_CAST(v) ((float)(v))
 #else
 #define SCALE_CAST(v) (v)
+#endif
+
+#if defined(USE_HALF_SCALE_ACC) && !defined(ACCUM_FP32)
+#ifndef HALF_SCALE_ACC_F
+#define HALF_SCALE_ACC_F 0.5f
+#endif
+#define HALF_SCALE_ACC ((half)(HALF_SCALE_ACC_F))
+#define HALF_SCALE_INV ((float)(1.0f / (HALF_SCALE_ACC_F)))
 #endif
 
     int m_4 = m >> 2;
@@ -57,6 +67,25 @@ kernel void kernel_mul_mat_Ab_Bi_8x4(
 #else
     half8 c0 = (half8)(0), c1 = (half8)(0), c2 = (half8)(0), c3 = (half8)(0); // 8x4 output elements
 #endif
+#if defined(USE_FP16_CHUNK_ACC) && !defined(ACCUM_FP32)
+    float8 c0_chunk = 0, c1_chunk = 0, c2_chunk = 0, c3_chunk = 0;
+    int chunk_steps = 0;
+#ifndef CHUNK_ACC_ITERS
+#define CHUNK_ACC_ITERS 32
+#endif
+#define CHUNK_ACC_FLUSH()                            \
+    do {                                             \
+        c0_chunk += convert_float8(c0);              \
+        c1_chunk += convert_float8(c1);              \
+        c2_chunk += convert_float8(c2);              \
+        c3_chunk += convert_float8(c3);              \
+        c0 = (half8)(0);                             \
+        c1 = (half8)(0);                             \
+        c2 = (half8)(0);                             \
+        c3 = (half8)(0);                             \
+        chunk_steps = 0;                             \
+    } while (0)
+#endif
 #ifdef USE_KAHAN_ACC
     float8 c0_corr = 0, c1_corr = 0, c2_corr = 0, c3_corr = 0;
 #define ACC_ADD(sum, corr, val)             \
@@ -67,11 +96,20 @@ kernel void kernel_mul_mat_Ab_Bi_8x4(
         (sum) = t;                          \
     } while (0)
 #else
+#ifdef USE_HALF_ACC_CLAMP
+#define ACC_ADD(sum, corr, val)                                             \
+    do {                                                                    \
+        half8 _tmp = (sum) + (val);                                         \
+        (sum) = clamp(_tmp, (half8)(-65504.0f), (half8)(65504.0f));         \
+    } while (0)
+#else
 #define ACC_ADD(sum, corr, val) \
     do {                        \
         (sum) += (val);         \
     } while (0)
 #endif
+#endif
+
 #ifdef ACCUM_FP32
     float8 B; // registers for activations
     float4 dequantized_weights; // registers for dequantized weights
@@ -93,12 +131,17 @@ kernel void kernel_mul_mat_Ab_Bi_8x4(
 
         // load 4 consecutive scales
         half4 scale = vload4(0, scale_ptr + (i/32)*(m));// (i/32) because 1 scale per 32 elements
+#if defined(USE_HALF_SCALE_ACC) && !defined(ACCUM_FP32)
+        half4 scale_eff = scale * (half4)(HALF_SCALE_ACC);
+#else
+        half4 scale_eff = scale;
+#endif
 
         // j=0
-        dequantized_weights.s0 = ((bits4.s0 & (0x000F)) - 8) * SCALE_CAST(scale.s0); // dequantize a row of the 16 weights
-        dequantized_weights.s1 = ((bits4.s1 & (0x000F)) - 8) * SCALE_CAST(scale.s1);
-        dequantized_weights.s2 = ((bits4.s2 & (0x000F)) - 8) * SCALE_CAST(scale.s2);
-        dequantized_weights.s3 = ((bits4.s3 & (0x000F)) - 8) * SCALE_CAST(scale.s3);
+        dequantized_weights.s0 = ((bits4.s0 & (0x000F)) - 8) * SCALE_CAST(scale_eff.s0); // dequantize a row of the 16 weights
+        dequantized_weights.s1 = ((bits4.s1 & (0x000F)) - 8) * SCALE_CAST(scale_eff.s1);
+        dequantized_weights.s2 = ((bits4.s2 & (0x000F)) - 8) * SCALE_CAST(scale_eff.s2);
+        dequantized_weights.s3 = ((bits4.s3 & (0x000F)) - 8) * SCALE_CAST(scale_eff.s3);
         ACC_ADD(c0, c0_corr, B * dequantized_weights.s0); // vector-scalar multiplication to accumulate
         ACC_ADD(c1, c1_corr, B * dequantized_weights.s1);
         ACC_ADD(c2, c2_corr, B * dequantized_weights.s2);
@@ -107,10 +150,10 @@ kernel void kernel_mul_mat_Ab_Bi_8x4(
         // j=1
         B.s0123 = READ_ACT4(src1, gy*2 + (i+1)*(n_4));
         B.s4567 = READ_ACT4(src1, gy*2 + (i+1)*(n_4)+1);
-        dequantized_weights.s0 = (((bits4.s0 & (0x00F0)) >> 4) - 8) * SCALE_CAST(scale.s0); // dequantize a row of the 16 weights
-        dequantized_weights.s1 = (((bits4.s1 & (0x00F0)) >> 4) - 8) * SCALE_CAST(scale.s1);
-        dequantized_weights.s2 = (((bits4.s2 & (0x00F0)) >> 4) - 8) * SCALE_CAST(scale.s2);
-        dequantized_weights.s3 = (((bits4.s3 & (0x00F0)) >> 4) - 8) * SCALE_CAST(scale.s3);
+        dequantized_weights.s0 = (((bits4.s0 & (0x00F0)) >> 4) - 8) * SCALE_CAST(scale_eff.s0); // dequantize a row of the 16 weights
+        dequantized_weights.s1 = (((bits4.s1 & (0x00F0)) >> 4) - 8) * SCALE_CAST(scale_eff.s1);
+        dequantized_weights.s2 = (((bits4.s2 & (0x00F0)) >> 4) - 8) * SCALE_CAST(scale_eff.s2);
+        dequantized_weights.s3 = (((bits4.s3 & (0x00F0)) >> 4) - 8) * SCALE_CAST(scale_eff.s3);
         ACC_ADD(c0, c0_corr, B * dequantized_weights.s0); //vector-scalar multiplication to accumulate
         ACC_ADD(c1, c1_corr, B * dequantized_weights.s1);
         ACC_ADD(c2, c2_corr, B * dequantized_weights.s2);
@@ -119,10 +162,10 @@ kernel void kernel_mul_mat_Ab_Bi_8x4(
         // j=2
         B.s0123 = READ_ACT4(src1, gy*2 + (i+2)*(n_4));
         B.s4567 = READ_ACT4(src1, gy*2 + (i+2)*(n_4)+1);
-        dequantized_weights.s0 = (((bits4.s0 & (0x0F00)) >> 8) - 8) * SCALE_CAST(scale.s0); // dequantize a row of the 16 weights
-        dequantized_weights.s1 = (((bits4.s1 & (0x0F00)) >> 8) - 8) * SCALE_CAST(scale.s1);
-        dequantized_weights.s2 = (((bits4.s2 & (0x0F00)) >> 8) - 8) * SCALE_CAST(scale.s2);
-        dequantized_weights.s3 = (((bits4.s3 & (0x0F00)) >> 8) - 8) * SCALE_CAST(scale.s3);
+        dequantized_weights.s0 = (((bits4.s0 & (0x0F00)) >> 8) - 8) * SCALE_CAST(scale_eff.s0); // dequantize a row of the 16 weights
+        dequantized_weights.s1 = (((bits4.s1 & (0x0F00)) >> 8) - 8) * SCALE_CAST(scale_eff.s1);
+        dequantized_weights.s2 = (((bits4.s2 & (0x0F00)) >> 8) - 8) * SCALE_CAST(scale_eff.s2);
+        dequantized_weights.s3 = (((bits4.s3 & (0x0F00)) >> 8) - 8) * SCALE_CAST(scale_eff.s3);
         ACC_ADD(c0, c0_corr, B * dequantized_weights.s0); // vector-scalar multiplication to accumulate
         ACC_ADD(c1, c1_corr, B * dequantized_weights.s1);
         ACC_ADD(c2, c2_corr, B * dequantized_weights.s2);
@@ -131,15 +174,42 @@ kernel void kernel_mul_mat_Ab_Bi_8x4(
         // j=3
         B.s0123 = READ_ACT4(src1, gy*2 + (i+3)*(n_4));
         B.s4567 = READ_ACT4(src1, gy*2 + (i+3)*(n_4)+1);
-        dequantized_weights.s0 = (((bits4.s0 & (0xF000)) >> 12) - 8) * SCALE_CAST(scale.s0); // dequantize a row of the 16 weights
-        dequantized_weights.s1 = (((bits4.s1 & (0xF000)) >> 12) - 8) * SCALE_CAST(scale.s1);
-        dequantized_weights.s2 = (((bits4.s2 & (0xF000)) >> 12) - 8) * SCALE_CAST(scale.s2);
-        dequantized_weights.s3 = (((bits4.s3 & (0xF000)) >> 12) - 8) * SCALE_CAST(scale.s3);
+        dequantized_weights.s0 = (((bits4.s0 & (0xF000)) >> 12) - 8) * SCALE_CAST(scale_eff.s0); // dequantize a row of the 16 weights
+        dequantized_weights.s1 = (((bits4.s1 & (0xF000)) >> 12) - 8) * SCALE_CAST(scale_eff.s1);
+        dequantized_weights.s2 = (((bits4.s2 & (0xF000)) >> 12) - 8) * SCALE_CAST(scale_eff.s2);
+        dequantized_weights.s3 = (((bits4.s3 & (0xF000)) >> 12) - 8) * SCALE_CAST(scale_eff.s3);
         ACC_ADD(c0, c0_corr, B * dequantized_weights.s0); // vector-scalar multiplication to accumulate
         ACC_ADD(c1, c1_corr, B * dequantized_weights.s1);
         ACC_ADD(c2, c2_corr, B * dequantized_weights.s2);
         ACC_ADD(c3, c3_corr, B * dequantized_weights.s3);
+#if defined(USE_FP16_CHUNK_ACC) && !defined(ACCUM_FP32)
+        ++chunk_steps;
+        if (chunk_steps == CHUNK_ACC_ITERS) {
+            CHUNK_ACC_FLUSH();
+        }
+#endif
     }
+
+#if defined(USE_FP16_CHUNK_ACC) && !defined(ACCUM_FP32)
+    if (chunk_steps != 0) {
+        CHUNK_ACC_FLUSH();
+    }
+#define C0_OUT c0_chunk
+#define C1_OUT c1_chunk
+#define C2_OUT c2_chunk
+#define C3_OUT c3_chunk
+#else
+#define C0_OUT c0
+#define C1_OUT c1
+#define C2_OUT c2
+#define C3_OUT c3
+#endif
+
+#if defined(USE_HALF_SCALE_ACC) && !defined(ACCUM_FP32)
+#define STORE_OUT(v) ((v) * HALF_SCALE_INV)
+#else
+#define STORE_OUT(v) (v)
+#endif
 
     int idx = (gy<<3)*m + (gx<<2); // vectorized store 16 elements
 
@@ -147,38 +217,52 @@ kernel void kernel_mul_mat_Ab_Bi_8x4(
     // if statements allow registers to be reused for each store
     // provides a performance boost due to reduced register footprint, which increases number of concurrent waves
     if(idx+3 < m*n_no_padding){
-        vstore4((float4)(c0.s0, c1.s0, c2.s0, c3.s0), 0, dst + idx);
+        vstore4((float4)(STORE_OUT(C0_OUT.s0), STORE_OUT(C1_OUT.s0), STORE_OUT(C2_OUT.s0), STORE_OUT(C3_OUT.s0)), 0, dst + idx);
         idx += m;
     }
     if(idx+3 < m*n_no_padding){
-        vstore4((float4)(c0.s1, c1.s1, c2.s1, c3.s1), 0, dst + idx);
+        vstore4((float4)(STORE_OUT(C0_OUT.s1), STORE_OUT(C1_OUT.s1), STORE_OUT(C2_OUT.s1), STORE_OUT(C3_OUT.s1)), 0, dst + idx);
         idx += m;
     }
     if(idx+3 < m*n_no_padding){
-        vstore4((float4)(c0.s2, c1.s2, c2.s2, c3.s2), 0, dst + idx);
+        vstore4((float4)(STORE_OUT(C0_OUT.s2), STORE_OUT(C1_OUT.s2), STORE_OUT(C2_OUT.s2), STORE_OUT(C3_OUT.s2)), 0, dst + idx);
         idx += m;
     }
     if(idx+3 < m*n_no_padding){
-        vstore4((float4)(c0.s3, c1.s3, c2.s3, c3.s3), 0, dst + idx);
+        vstore4((float4)(STORE_OUT(C0_OUT.s3), STORE_OUT(C1_OUT.s3), STORE_OUT(C2_OUT.s3), STORE_OUT(C3_OUT.s3)), 0, dst + idx);
         idx += m;
     }
     if(idx+3 < m*n_no_padding){
-        vstore4((float4)(c0.s4, c1.s4, c2.s4, c3.s4), 0, dst + idx);
+        vstore4((float4)(STORE_OUT(C0_OUT.s4), STORE_OUT(C1_OUT.s4), STORE_OUT(C2_OUT.s4), STORE_OUT(C3_OUT.s4)), 0, dst + idx);
         idx += m;
     }
     if(idx+3 < m*n_no_padding){
-        vstore4((float4)(c0.s5, c1.s5, c2.s5, c3.s5), 0, dst + idx);
+        vstore4((float4)(STORE_OUT(C0_OUT.s5), STORE_OUT(C1_OUT.s5), STORE_OUT(C2_OUT.s5), STORE_OUT(C3_OUT.s5)), 0, dst + idx);
         idx += m;
     }
     if(idx+3 < m*n_no_padding){
-        vstore4((float4)(c0.s6, c1.s6, c2.s6, c3.s6), 0, dst + idx);
+        vstore4((float4)(STORE_OUT(C0_OUT.s6), STORE_OUT(C1_OUT.s6), STORE_OUT(C2_OUT.s6), STORE_OUT(C3_OUT.s6)), 0, dst + idx);
         idx += m;
     }
     if(idx+3 < m*n_no_padding){
-        vstore4((float4)(c0.s7, c1.s7, c2.s7, c3.s7), 0, dst + idx);
+        vstore4((float4)(STORE_OUT(C0_OUT.s7), STORE_OUT(C1_OUT.s7), STORE_OUT(C2_OUT.s7), STORE_OUT(C3_OUT.s7)), 0, dst + idx);
     }
 
 #undef ACC_ADD
+#if defined(USE_FP16_CHUNK_ACC) && !defined(ACCUM_FP32)
+#undef CHUNK_ACC_FLUSH
+#undef CHUNK_ACC_ITERS
+#endif
+#undef C0_OUT
+#undef C1_OUT
+#undef C2_OUT
+#undef C3_OUT
+#undef STORE_OUT
+#if defined(USE_HALF_SCALE_ACC) && !defined(ACCUM_FP32)
+#undef HALF_SCALE_ACC
+#undef HALF_SCALE_INV
+#undef HALF_SCALE_ACC_F
+#endif
 #undef SCALE_CAST
 #undef READ_ACT4
 #undef ACCUM_FP32
