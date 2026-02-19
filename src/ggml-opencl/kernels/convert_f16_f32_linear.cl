@@ -107,7 +107,7 @@ __kernel void kernel_f16_to_f32_nhd_keep_head_tail(
     dst_ptr[i] = convert_float(src_ptr[src_i]);
 }
 
-// Reorder contiguous [H, Q, D] to contiguous [Q, H, D] for mldrift attention output.
+// Reorder contiguous [H, Q, D] to contiguous [Q, H, D] for replay attention output.
 __kernel void kernel_f32_reorder_hqd_to_qhd(
         __global float * dst,
         const ulong      dst_offset,

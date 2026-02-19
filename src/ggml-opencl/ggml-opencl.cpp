@@ -28,6 +28,7 @@
 #include <array>
 #include <cmath>
 #include <cctype>
+#include <initializer_list>
 #include <cstdio>
 #include <map>
 #include <memory>
@@ -39,6 +40,9 @@
 
 #include "mldrift_attn_h24_m4352_k128.h"
 #include "mldrift_attn_h30_m4224_k128.h"
+
+namespace ggml_opencl_replay_h24_m4352 = ggml_opencl_mldrift_h24_m4352;
+namespace ggml_opencl_replay_h30_m4224 = ggml_opencl_mldrift_h30_m4224;
 
 #undef MIN
 #undef MAX
@@ -210,6 +214,40 @@ static bool ggml_opencl_tensor_name_matches(const ggml_tensor * tensor) {
         }
     }
     return false;
+}
+
+static bool ggml_opencl_env_flag_any(std::initializer_list<const char *> names) {
+    for (const char * name : names) {
+        if (name == nullptr || name[0] == '\0') {
+            continue;
+        }
+        const char * v = std::getenv(name);
+        if (v != nullptr && v[0] != '\0' && v[0] != '0') {
+            return true;
+        }
+    }
+    return false;
+}
+
+static const char * ggml_opencl_env_first_any(std::initializer_list<const char *> names) {
+    for (const char * name : names) {
+        if (name == nullptr || name[0] == '\0') {
+            continue;
+        }
+        const char * v = std::getenv(name);
+        if (v != nullptr && v[0] != '\0') {
+            return v;
+        }
+    }
+    return nullptr;
+}
+
+static bool ggml_opencl_env_flag2(const char * primary_name, const char * legacy_name) {
+    return ggml_opencl_env_flag_any({primary_name, legacy_name});
+}
+
+static const char * ggml_opencl_env_value2(const char * primary_name, const char * legacy_name) {
+    return ggml_opencl_env_first_any({primary_name, legacy_name});
 }
 
 //------------------------------------------------------------------------------
@@ -572,22 +610,22 @@ struct ggml_backend_opencl_context {
     ggml_cl_buffer prealloc_src0;
     ggml_cl_buffer prealloc_src1;
 
-    struct mldrift_attn_h24_state {
+    struct replay_attn_h24_state {
         bool initialized = false;
         int shape_m = 0;
-        std::array<cl_mem, ggml_opencl_mldrift_h24_m4352::kNumBuffers> buffers{};
-        std::array<cl_mem, ggml_opencl_mldrift_h24_m4352::kNumImages> images{};
-        std::array<cl_program, ggml_opencl_mldrift_h24_m4352::kNumPrograms> programs{};
-        std::array<cl_kernel, ggml_opencl_mldrift_h24_m4352::kNumKernels> kernels{};
-    } mldrift_attn_h24;
+        std::array<cl_mem, ggml_opencl_replay_h24_m4352::kNumBuffers> buffers{};
+        std::array<cl_mem, ggml_opencl_replay_h24_m4352::kNumImages> images{};
+        std::array<cl_program, ggml_opencl_replay_h24_m4352::kNumPrograms> programs{};
+        std::array<cl_kernel, ggml_opencl_replay_h24_m4352::kNumKernels> kernels{};
+    } replay_attn_h24;
 
-    struct mldrift_attn_h30_state {
+    struct replay_attn_h30_state {
         bool initialized = false;
-        std::array<cl_mem, ggml_opencl_mldrift_h30_m4224::kNumBuffers> buffers{};
-        std::array<cl_mem, ggml_opencl_mldrift_h30_m4224::kNumImages> images{};
-        std::array<cl_program, ggml_opencl_mldrift_h30_m4224::kNumPrograms> programs{};
-        std::array<cl_kernel, ggml_opencl_mldrift_h30_m4224::kNumKernels> kernels{};
-    } mldrift_attn_h30;
+        std::array<cl_mem, ggml_opencl_replay_h30_m4224::kNumBuffers> buffers{};
+        std::array<cl_mem, ggml_opencl_replay_h30_m4224::kNumImages> images{};
+        std::array<cl_program, ggml_opencl_replay_h30_m4224::kNumPrograms> programs{};
+        std::array<cl_kernel, ggml_opencl_replay_h30_m4224::kNumKernels> kernels{};
+    } replay_attn_h30;
 
     cl_program program_add;
     cl_program program_add_id;
@@ -995,8 +1033,8 @@ static cl_program build_program_from_source(cl_context ctx, cl_device_id dev, co
     return p;
 }
 
-static void mldrift_attn_release_h24(ggml_backend_opencl_context * backend_ctx) {
-    auto & st = backend_ctx->mldrift_attn_h24;
+static void replay_attn_release_h24(ggml_backend_opencl_context * backend_ctx) {
+    auto & st = backend_ctx->replay_attn_h24;
 
     for (cl_kernel & kernel : st.kernels) {
         if (kernel != nullptr) {
@@ -1027,16 +1065,16 @@ static void mldrift_attn_release_h24(ggml_backend_opencl_context * backend_ctx) 
     st.shape_m = 0;
 }
 
-static bool mldrift_attn_init_h24(ggml_backend_opencl_context * backend_ctx, int shape_m) {
-    auto & st = backend_ctx->mldrift_attn_h24;
-    namespace mh = ggml_opencl_mldrift_h24_m4352;
+static bool replay_attn_init_h24(ggml_backend_opencl_context * backend_ctx, int shape_m) {
+    auto & st = backend_ctx->replay_attn_h24;
+    namespace mh = ggml_opencl_replay_h24_m4352;
 
     if (st.initialized) {
         // Reuse preallocated replay resources for all supported M <= kShapeM.
         if (st.shape_m == mh::kShapeM) {
             return true;
         }
-        mldrift_attn_release_h24(backend_ctx);
+        replay_attn_release_h24(backend_ctx);
     }
 
     if (shape_m <= 0 || shape_m > mh::kShapeM) {
@@ -1051,15 +1089,15 @@ static bool mldrift_attn_init_h24(ggml_backend_opencl_context * backend_ctx, int
             continue;
         }
         if (bytes > backend_ctx->max_alloc_size) {
-            GGML_LOG_WARN("ggml_opencl: mldrift buffer %d size %zu exceeds max alloc %zu\n",
+            GGML_LOG_WARN("ggml_opencl: replay-attn buffer %d size %zu exceeds max alloc %zu\n",
                           i, bytes, backend_ctx->max_alloc_size);
-            mldrift_attn_release_h24(backend_ctx);
+            replay_attn_release_h24(backend_ctx);
             return false;
         }
         st.buffers[i] = clCreateBuffer(backend_ctx->context, mh::kBufferFlags[i], bytes, nullptr, &status);
         if (!mh::mldrift_cl_check(status, "buffer alloc")) {
-            GGML_LOG_WARN("ggml_opencl: mldrift buffer %d alloc failed (%d)\n", i, (int) status);
-            mldrift_attn_release_h24(backend_ctx);
+            GGML_LOG_WARN("ggml_opencl: replay-attn buffer %d alloc failed (%d)\n", i, (int) status);
+            replay_attn_release_h24(backend_ctx);
             return false;
         }
     }
@@ -1079,7 +1117,7 @@ static bool mldrift_attn_init_h24(ggml_backend_opencl_context * backend_ctx, int
         desc.image_depth = mh::kImageDepth[i];
 
         int backing = mh::kImageBackingBuffer[i];
-        if (std::getenv("GGML_OPENCL_MLDRIFT_INPUT_IMAGES_678") != nullptr) {
+        if (ggml_opencl_env_flag2("GGML_OPENCL_REPLAY_INPUT_IMAGES_678", "GGML_OPENCL_MLDRIFT_INPUT_IMAGES_678")) {
             // Debug override: bind first 3 images to q/k/v input buffers 6/7/8.
             if (i == 0) backing = 6;
             if (i == 1) backing = 7;
@@ -1091,8 +1129,8 @@ static bool mldrift_attn_init_h24(ggml_backend_opencl_context * backend_ctx, int
 
         st.images[i] = clCreateImage(backend_ctx->context, CL_MEM_READ_WRITE, &fmt, &desc, nullptr, &status);
         if (!mh::mldrift_cl_check(status, "image alloc")) {
-            GGML_LOG_WARN("ggml_opencl: mldrift image %d alloc failed (%d)\n", i, (int) status);
-            mldrift_attn_release_h24(backend_ctx);
+            GGML_LOG_WARN("ggml_opencl: replay-attn image %d alloc failed (%d)\n", i, (int) status);
+            replay_attn_release_h24(backend_ctx);
             return false;
         }
     }
@@ -1111,14 +1149,14 @@ static bool mldrift_attn_init_h24(ggml_backend_opencl_context * backend_ctx, int
         const int program_id = mh::kKernelProgramId[i];
         st.kernels[i] = clCreateKernel(st.programs[program_id], "main_function", &status);
         if (!mh::mldrift_cl_check(status, "create kernel")) {
-            GGML_LOG_WARN("ggml_opencl: mldrift create kernel %d failed (%d)\n", i, (int) status);
-            mldrift_attn_release_h24(backend_ctx);
+            GGML_LOG_WARN("ggml_opencl: replay-attn create kernel %d failed (%d)\n", i, (int) status);
+            replay_attn_release_h24(backend_ctx);
             return false;
         }
     }
 
     if (!mh::set_kernel_args(st.kernels.data(), st.buffers.data(), st.images.data())) {
-        mldrift_attn_release_h24(backend_ctx);
+        replay_attn_release_h24(backend_ctx);
         return false;
     }
 
@@ -1127,15 +1165,15 @@ static bool mldrift_attn_init_h24(ggml_backend_opencl_context * backend_ctx, int
     return true;
 }
 
-static inline bool mldrift_set_kernel_arg_int4_h24(cl_kernel kernel, cl_uint arg_index, int x, int y, int z, int w, const char * tag) {
-    namespace mh = ggml_opencl_mldrift_h24_m4352;
+static inline bool replay_set_kernel_arg_int4_h24(cl_kernel kernel, cl_uint arg_index, int x, int y, int z, int w, const char * tag) {
+    namespace mh = ggml_opencl_replay_h24_m4352;
     const int vals[4] = {x, y, z, w};
     return mh::mldrift_cl_check(clSetKernelArg(kernel, arg_index, sizeof(vals), vals), tag);
 }
 
-static bool mldrift_attn_patch_shape_h24(ggml_backend_opencl_context * backend_ctx, int shape_m) {
-    namespace mh = ggml_opencl_mldrift_h24_m4352;
-    auto & st = backend_ctx->mldrift_attn_h24;
+static bool replay_attn_patch_shape_h24(ggml_backend_opencl_context * backend_ctx, int shape_m) {
+    namespace mh = ggml_opencl_replay_h24_m4352;
+    auto & st = backend_ctx->replay_attn_h24;
 
     if (!st.initialized) {
         return false;
@@ -1153,29 +1191,29 @@ static bool mldrift_attn_patch_shape_h24(ggml_backend_opencl_context * backend_c
     const int m24 = m * 24;
     const int m192 = m * 192;
 
-    if (!mldrift_set_kernel_arg_int4_h24(st.kernels[0], 2, m,   24, m4, 128, "SetKernelArg dyn 0:2")) return false;
-    if (!mldrift_set_kernel_arg_int4_h24(st.kernels[1], 2, 8, m192, 32, 24, "SetKernelArg dyn 1:2")) return false;
-    if (!mldrift_set_kernel_arg_int4_h24(st.kernels[1], 3, m4, 128, 128, 24, "SetKernelArg dyn 1:3")) return false;
-    if (!mldrift_set_kernel_arg_int4_h24(st.kernels[2], 4, 24,  m4,  m, 32, "SetKernelArg dyn 2:4")) return false;
-    if (!mldrift_set_kernel_arg_int4_h24(st.kernels[3], 2, 24,   1,  m,  m, "SetKernelArg dyn 3:2")) return false;
-    if (!mldrift_set_kernel_arg_int4_h24(st.kernels[3], 3, 24,   m,  0,  0, "SetKernelArg dyn 3:3")) return false;
-    if (!mldrift_set_kernel_arg_int4_h24(st.kernels[4], 3, 24,  m4,  m,  1, "SetKernelArg dyn 4:3")) return false;
-    if (!mldrift_set_kernel_arg_int4_h24(st.kernels[4], 4, 24,   m,  0,  0, "SetKernelArg dyn 4:4")) return false;
-    if (!mldrift_set_kernel_arg_int4_h24(st.kernels[5], 2, 8, m192, m4, 32, "SetKernelArg dyn 5:2")) return false;
-    if (!mldrift_set_kernel_arg_int4_h24(st.kernels[5], 3, m,   24, 24,  0, "SetKernelArg dyn 5:3")) return false;
-    if (!mldrift_set_kernel_arg_int4_h24(st.kernels[6], 4, 24,  32,  m, 32, "SetKernelArg dyn 6:4")) return false;
-    if (!mldrift_set_kernel_arg_int4_h24(st.kernels[6], 5, m4,   0,  0, 24, "SetKernelArg dyn 6:5")) return false;
-    if (!mldrift_set_kernel_arg_int4_h24(st.kernels[6], 6, m24, m4,  m,  1, "SetKernelArg dyn 6:6")) return false;
-    if (!mldrift_set_kernel_arg_int4_h24(st.kernels[7], 2, 128, 24, 32,  m, "SetKernelArg dyn 7:2")) return false;
-    if (!mldrift_set_kernel_arg_int4_h24(st.kernels[8], 2, 128, 24, 32,  m, "SetKernelArg dyn 8:2")) return false;
-    if (!mldrift_set_kernel_arg_int4_h24(st.kernels[9], 2, 128, 24, 32,  m, "SetKernelArg dyn 9:2")) return false;
-    if (!mldrift_set_kernel_arg_int4_h24(st.kernels[10], 2, 128, 24, 32, m, "SetKernelArg dyn 10:2")) return false;
+    if (!replay_set_kernel_arg_int4_h24(st.kernels[0], 2, m,   24, m4, 128, "SetKernelArg dyn 0:2")) return false;
+    if (!replay_set_kernel_arg_int4_h24(st.kernels[1], 2, 8, m192, 32, 24, "SetKernelArg dyn 1:2")) return false;
+    if (!replay_set_kernel_arg_int4_h24(st.kernels[1], 3, m4, 128, 128, 24, "SetKernelArg dyn 1:3")) return false;
+    if (!replay_set_kernel_arg_int4_h24(st.kernels[2], 4, 24,  m4,  m, 32, "SetKernelArg dyn 2:4")) return false;
+    if (!replay_set_kernel_arg_int4_h24(st.kernels[3], 2, 24,   1,  m,  m, "SetKernelArg dyn 3:2")) return false;
+    if (!replay_set_kernel_arg_int4_h24(st.kernels[3], 3, 24,   m,  0,  0, "SetKernelArg dyn 3:3")) return false;
+    if (!replay_set_kernel_arg_int4_h24(st.kernels[4], 3, 24,  m4,  m,  1, "SetKernelArg dyn 4:3")) return false;
+    if (!replay_set_kernel_arg_int4_h24(st.kernels[4], 4, 24,   m,  0,  0, "SetKernelArg dyn 4:4")) return false;
+    if (!replay_set_kernel_arg_int4_h24(st.kernels[5], 2, 8, m192, m4, 32, "SetKernelArg dyn 5:2")) return false;
+    if (!replay_set_kernel_arg_int4_h24(st.kernels[5], 3, m,   24, 24,  0, "SetKernelArg dyn 5:3")) return false;
+    if (!replay_set_kernel_arg_int4_h24(st.kernels[6], 4, 24,  32,  m, 32, "SetKernelArg dyn 6:4")) return false;
+    if (!replay_set_kernel_arg_int4_h24(st.kernels[6], 5, m4,   0,  0, 24, "SetKernelArg dyn 6:5")) return false;
+    if (!replay_set_kernel_arg_int4_h24(st.kernels[6], 6, m24, m4,  m,  1, "SetKernelArg dyn 6:6")) return false;
+    if (!replay_set_kernel_arg_int4_h24(st.kernels[7], 2, 128, 24, 32,  m, "SetKernelArg dyn 7:2")) return false;
+    if (!replay_set_kernel_arg_int4_h24(st.kernels[8], 2, 128, 24, 32,  m, "SetKernelArg dyn 8:2")) return false;
+    if (!replay_set_kernel_arg_int4_h24(st.kernels[9], 2, 128, 24, 32,  m, "SetKernelArg dyn 9:2")) return false;
+    if (!replay_set_kernel_arg_int4_h24(st.kernels[10], 2, 128, 24, 32, m, "SetKernelArg dyn 10:2")) return false;
 
     return true;
 }
 
-static inline void mldrift_attn_patch_gws_h24(size_t gws[][3], int shape_m) {
-    namespace mh = ggml_opencl_mldrift_h24_m4352;
+static inline void replay_attn_patch_gws_h24(size_t gws[][3], int shape_m) {
+    namespace mh = ggml_opencl_replay_h24_m4352;
     for (int kid = 0; kid < mh::kNumKernels; ++kid) {
         gws[kid][0] = mh::kKernelGws[kid][0];
         gws[kid][1] = mh::kKernelGws[kid][1];
@@ -1199,18 +1237,18 @@ static inline void mldrift_attn_patch_gws_h24(size_t gws[][3], int shape_m) {
     gws[10][0] = m;
 }
 
-static inline bool mldrift_set_kernel_arg_int4_h30(cl_kernel kernel, cl_uint arg_index, int x, int y, int z, int w, const char * tag) {
-    namespace mh = ggml_opencl_mldrift_h30_m4224;
+static inline bool replay_set_kernel_arg_int4_h30(cl_kernel kernel, cl_uint arg_index, int x, int y, int z, int w, const char * tag) {
+    namespace mh = ggml_opencl_replay_h30_m4224;
     const int vals[4] = {x, y, z, w};
     return mh::mldrift_cl_check(clSetKernelArg(kernel, arg_index, sizeof(vals), vals), tag);
 }
 
-static bool mldrift_attn_patch_shape_h30(ggml_backend_opencl_context * backend_ctx, int shape_m, int shape_n) {
-    namespace mh = ggml_opencl_mldrift_h30_m4224;
-    auto & st = backend_ctx->mldrift_attn_h30;
+static bool replay_attn_patch_shape_h30(ggml_backend_opencl_context * backend_ctx, int shape_m, int shape_n) {
+    namespace mh = ggml_opencl_replay_h30_m4224;
+    auto & st = backend_ctx->replay_attn_h30;
 
     if (!st.initialized) {
-        GGML_LOG_WARN("ggml_opencl: mldrift(h30) patch requested before init (M=%d, N=%d)\n", shape_m, shape_n);
+        GGML_LOG_WARN("ggml_opencl: replay-attn(h30) patch requested before init (M=%d, N=%d)\n", shape_m, shape_n);
         return false;
     }
     if (shape_m == mh::kShapeM && shape_n == mh::kShapeN) {
@@ -1219,7 +1257,7 @@ static bool mldrift_attn_patch_shape_h30(ggml_backend_opencl_context * backend_c
     // The kernels are vectorized in groups of 4 channels.
     if (shape_m <= 0 || shape_m > mh::kShapeM || (shape_m % 4) != 0 ||
         shape_n <= 0 || shape_n > mh::kShapeN || (shape_n % 4) != 0) {
-        GGML_LOG_WARN("ggml_opencl: mldrift(h30) unsupported dynamic shape M=%d N=%d (maxM=%d maxN=%d mod4=(%d,%d))\n",
+        GGML_LOG_WARN("ggml_opencl: replay-attn(h30) unsupported dynamic shape M=%d N=%d (maxM=%d maxN=%d mod4=(%d,%d))\n",
                       shape_m, shape_n, mh::kShapeM, mh::kShapeN, shape_m % 4, shape_n % 4);
         return false;
     }
@@ -1230,29 +1268,29 @@ static bool mldrift_attn_patch_shape_h30(ggml_backend_opencl_context * backend_c
     const int m240 = m * 240;
     const int n = shape_n;
 
-    if (!mldrift_set_kernel_arg_int4_h30(st.kernels[0], 2, m, 30, m4, 128, "SetKernelArg dyn h30 0:2")) return false;
-    if (!mldrift_set_kernel_arg_int4_h30(st.kernels[1], 2, 8, m240, 32, 128, "SetKernelArg dyn h30 1:2")) return false;
-    if (!mldrift_set_kernel_arg_int4_h30(st.kernels[1], 3, 30, 30, 30, m4, "SetKernelArg dyn h30 1:3")) return false;
-    if (!mldrift_set_kernel_arg_int4_h30(st.kernels[2], 4, 30, m4, m, 32, "SetKernelArg dyn h30 2:4")) return false;
-    if (!mldrift_set_kernel_arg_int4_h30(st.kernels[3], 2, 30, 1, m, m, "SetKernelArg dyn h30 3:2")) return false;
-    if (!mldrift_set_kernel_arg_int4_h30(st.kernels[3], 3, 30, m, 0, 0, "SetKernelArg dyn h30 3:3")) return false;
-    if (!mldrift_set_kernel_arg_int4_h30(st.kernels[4], 3, 30, m4, m, 1, "SetKernelArg dyn h30 4:3")) return false;
-    if (!mldrift_set_kernel_arg_int4_h30(st.kernels[4], 4, 30, m, 0, 0, "SetKernelArg dyn h30 4:4")) return false;
-    if (!mldrift_set_kernel_arg_int4_h30(st.kernels[5], 2, 8, m240, m4, m, "SetKernelArg dyn h30 5:2")) return false;
-    if (!mldrift_set_kernel_arg_int4_h30(st.kernels[6], 4, 30, 32, m, 32, "SetKernelArg dyn h30 6:4")) return false;
-    if (!mldrift_set_kernel_arg_int4_h30(st.kernels[6], 5, m4, 0, 0, 30, "SetKernelArg dyn h30 6:5")) return false;
-    if (!mldrift_set_kernel_arg_int4_h30(st.kernels[6], 6, m30, m4, m, 1, "SetKernelArg dyn h30 6:6")) return false;
-    if (!mldrift_set_kernel_arg_int4_h30(st.kernels[7], 2, 128, 30, 32, m, "SetKernelArg dyn h30 7:2")) return false;
+    if (!replay_set_kernel_arg_int4_h30(st.kernels[0], 2, m, 30, m4, 128, "SetKernelArg dyn h30 0:2")) return false;
+    if (!replay_set_kernel_arg_int4_h30(st.kernels[1], 2, 8, m240, 32, 128, "SetKernelArg dyn h30 1:2")) return false;
+    if (!replay_set_kernel_arg_int4_h30(st.kernels[1], 3, 30, 30, 30, m4, "SetKernelArg dyn h30 1:3")) return false;
+    if (!replay_set_kernel_arg_int4_h30(st.kernels[2], 4, 30, m4, m, 32, "SetKernelArg dyn h30 2:4")) return false;
+    if (!replay_set_kernel_arg_int4_h30(st.kernels[3], 2, 30, 1, m, m, "SetKernelArg dyn h30 3:2")) return false;
+    if (!replay_set_kernel_arg_int4_h30(st.kernels[3], 3, 30, m, 0, 0, "SetKernelArg dyn h30 3:3")) return false;
+    if (!replay_set_kernel_arg_int4_h30(st.kernels[4], 3, 30, m4, m, 1, "SetKernelArg dyn h30 4:3")) return false;
+    if (!replay_set_kernel_arg_int4_h30(st.kernels[4], 4, 30, m, 0, 0, "SetKernelArg dyn h30 4:4")) return false;
+    if (!replay_set_kernel_arg_int4_h30(st.kernels[5], 2, 8, m240, m4, m, "SetKernelArg dyn h30 5:2")) return false;
+    if (!replay_set_kernel_arg_int4_h30(st.kernels[6], 4, 30, 32, m, 32, "SetKernelArg dyn h30 6:4")) return false;
+    if (!replay_set_kernel_arg_int4_h30(st.kernels[6], 5, m4, 0, 0, 30, "SetKernelArg dyn h30 6:5")) return false;
+    if (!replay_set_kernel_arg_int4_h30(st.kernels[6], 6, m30, m4, m, 1, "SetKernelArg dyn h30 6:6")) return false;
+    if (!replay_set_kernel_arg_int4_h30(st.kernels[7], 2, 128, 30, 32, m, "SetKernelArg dyn h30 7:2")) return false;
     // K/V upload width tracks N (kv), not M (query/output).
-    if (!mldrift_set_kernel_arg_int4_h30(st.kernels[8], 2, 128, 30, 32, n, "SetKernelArg dyn h30 8:2")) return false;
-    if (!mldrift_set_kernel_arg_int4_h30(st.kernels[9], 2, 128, 30, 32, n, "SetKernelArg dyn h30 9:2")) return false;
-    if (!mldrift_set_kernel_arg_int4_h30(st.kernels[10], 2, 128, 30, 32, m, "SetKernelArg dyn h30 10:2")) return false;
+    if (!replay_set_kernel_arg_int4_h30(st.kernels[8], 2, 128, 30, 32, n, "SetKernelArg dyn h30 8:2")) return false;
+    if (!replay_set_kernel_arg_int4_h30(st.kernels[9], 2, 128, 30, 32, n, "SetKernelArg dyn h30 9:2")) return false;
+    if (!replay_set_kernel_arg_int4_h30(st.kernels[10], 2, 128, 30, 32, m, "SetKernelArg dyn h30 10:2")) return false;
 
     return true;
 }
 
-static inline void mldrift_attn_patch_gws_h30(size_t gws[][3], int shape_m, int shape_n) {
-    namespace mh = ggml_opencl_mldrift_h30_m4224;
+static inline void replay_attn_patch_gws_h30(size_t gws[][3], int shape_m, int shape_n) {
+    namespace mh = ggml_opencl_replay_h30_m4224;
     for (int kid = 0; kid < mh::kNumKernels; ++kid) {
         gws[kid][0] = mh::kKernelGws[kid][0];
         gws[kid][1] = mh::kKernelGws[kid][1];
@@ -1277,8 +1315,8 @@ static inline void mldrift_attn_patch_gws_h30(size_t gws[][3], int shape_m, int 
     gws[10][0] = m;
 }
 
-static void mldrift_attn_release_h30(ggml_backend_opencl_context * backend_ctx) {
-    auto & st = backend_ctx->mldrift_attn_h30;
+static void replay_attn_release_h30(ggml_backend_opencl_context * backend_ctx) {
+    auto & st = backend_ctx->replay_attn_h30;
 
     for (cl_kernel & kernel : st.kernels) {
         if (kernel != nullptr) {
@@ -1308,9 +1346,9 @@ static void mldrift_attn_release_h30(ggml_backend_opencl_context * backend_ctx) 
     st.initialized = false;
 }
 
-static bool mldrift_attn_init_h30(ggml_backend_opencl_context * backend_ctx) {
-    namespace mh = ggml_opencl_mldrift_h30_m4224;
-    auto & st = backend_ctx->mldrift_attn_h30;
+static bool replay_attn_init_h30(ggml_backend_opencl_context * backend_ctx) {
+    namespace mh = ggml_opencl_replay_h30_m4224;
+    auto & st = backend_ctx->replay_attn_h30;
 
     if (st.initialized) {
         return true;
@@ -1324,15 +1362,15 @@ static bool mldrift_attn_init_h30(ggml_backend_opencl_context * backend_ctx) {
             continue;
         }
         if (bytes > backend_ctx->max_alloc_size) {
-            GGML_LOG_WARN("ggml_opencl: mldrift(h30) buffer %d size %zu exceeds max alloc %zu\n",
+            GGML_LOG_WARN("ggml_opencl: replay-attn(h30) buffer %d size %zu exceeds max alloc %zu\n",
                           i, bytes, backend_ctx->max_alloc_size);
-            mldrift_attn_release_h30(backend_ctx);
+            replay_attn_release_h30(backend_ctx);
             return false;
         }
         st.buffers[i] = clCreateBuffer(backend_ctx->context, mh::kBufferFlags[i], bytes, nullptr, &status);
         if (!mh::mldrift_cl_check(status, "buffer alloc")) {
-            GGML_LOG_WARN("ggml_opencl: mldrift(h30) buffer %d alloc failed (%d)\n", i, (int) status);
-            mldrift_attn_release_h30(backend_ctx);
+            GGML_LOG_WARN("ggml_opencl: replay-attn(h30) buffer %d alloc failed (%d)\n", i, (int) status);
+            replay_attn_release_h30(backend_ctx);
             return false;
         }
     }
@@ -1359,8 +1397,8 @@ static bool mldrift_attn_init_h30(ggml_backend_opencl_context * backend_ctx) {
 
         st.images[i] = clCreateImage(backend_ctx->context, CL_MEM_READ_WRITE, &fmt, &desc, nullptr, &status);
         if (!mh::mldrift_cl_check(status, "image alloc")) {
-            GGML_LOG_WARN("ggml_opencl: mldrift(h30) image %d alloc failed (%d)\n", i, (int) status);
-            mldrift_attn_release_h30(backend_ctx);
+            GGML_LOG_WARN("ggml_opencl: replay-attn(h30) image %d alloc failed (%d)\n", i, (int) status);
+            replay_attn_release_h30(backend_ctx);
             return false;
         }
     }
@@ -1379,14 +1417,14 @@ static bool mldrift_attn_init_h30(ggml_backend_opencl_context * backend_ctx) {
         const int program_id = mh::kKernelProgramId[i];
         st.kernels[i] = clCreateKernel(st.programs[program_id], "main_function", &status);
         if (!mh::mldrift_cl_check(status, "create kernel")) {
-            GGML_LOG_WARN("ggml_opencl: mldrift(h30) create kernel %d failed (%d)\n", i, (int) status);
-            mldrift_attn_release_h30(backend_ctx);
+            GGML_LOG_WARN("ggml_opencl: replay-attn(h30) create kernel %d failed (%d)\n", i, (int) status);
+            replay_attn_release_h30(backend_ctx);
             return false;
         }
     }
 
     if (!mh::set_kernel_args(st.kernels.data(), st.buffers.data(), st.images.data())) {
-        mldrift_attn_release_h30(backend_ctx);
+        replay_attn_release_h30(backend_ctx);
         return false;
     }
 
@@ -3658,8 +3696,8 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
 
 static void ggml_cl2_free(ggml_backend_t backend) {
     ggml_backend_opencl_context * ctx = (ggml_backend_opencl_context *) backend->context;
-    mldrift_attn_release_h24(ctx);
-    mldrift_attn_release_h30(ctx);
+    replay_attn_release_h24(ctx);
+    replay_attn_release_h30(ctx);
     ctx->free();
 
     // The CL context is shared by all backends, release it if all backends have been released
@@ -9604,8 +9642,8 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         sinks == nullptr &&
         n_batch == 1 &&
         n_head == 30 && d_head_q == 128 && d_head_v == 128 &&
-        n_q > 0 && n_q <= ggml_opencl_mldrift_h30_m4224::kShapeM &&
-        (n_kv == ggml_opencl_mldrift_h30_m4224::kShapeN || n_kv == ggml_opencl_mldrift_h30_m4224::kShapeN + 128);
+        n_q > 0 && n_q <= ggml_opencl_replay_h30_m4224::kShapeM &&
+        (n_kv == ggml_opencl_replay_h30_m4224::kShapeN || n_kv == ggml_opencl_replay_h30_m4224::kShapeN + 128);
     if (flash_dump_dir != nullptr && (flash_dump_match_h24 || flash_dump_match_h30)) {
         flash_dump_call = flash_dump_call_counter.fetch_add(1, std::memory_order_relaxed);
         int target_call = 0;
@@ -9626,15 +9664,15 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                                    std::string(flash_dump_dir) + "/flash_call" + std::to_string(flash_dump_call) + "_v_f16.bin");
     }
 
-    const bool use_mldrift = std::getenv("GGML_OPENCL_MLDRIFT") != nullptr;
-    const bool mldrift_dynamic_4352 = std::getenv("GGML_OPENCL_MLDRIFT_DYNAMIC_4352") != nullptr;
-    const bool mldrift_debug = std::getenv("GGML_OPENCL_MLDRIFT_DEBUG") != nullptr;
-    const bool mldrift_debug_all = std::getenv("GGML_OPENCL_MLDRIFT_DEBUG_ALL") != nullptr;
-    if (use_mldrift && mldrift_debug) {
+    const bool use_replay_fa = ggml_opencl_env_flag2("GGML_OPENCL_REPLAY_FA", "GGML_OPENCL_MLDRIFT");
+    const bool replay_dynamic_4352 = ggml_opencl_env_flag2("GGML_OPENCL_REPLAY_DYNAMIC_4352", "GGML_OPENCL_MLDRIFT_DYNAMIC_4352");
+    const bool replay_debug = ggml_opencl_env_flag2("GGML_OPENCL_REPLAY_DEBUG", "GGML_OPENCL_MLDRIFT_DEBUG");
+    const bool replay_debug_all = ggml_opencl_env_flag2("GGML_OPENCL_REPLAY_DEBUG_ALL", "GGML_OPENCL_MLDRIFT_DEBUG_ALL");
+    if (use_replay_fa && replay_debug) {
         static bool printed = false;
         if (!printed) {
             printed = true;
-            GGML_LOG_INFO("ggml_opencl: mldrift check q=(%d,%d,%d,%d,%d) k=(%d,%d,%d,%d,%d) v_type=%d mask=%d sinks=%d contig(q,k,v,o)=(%d,%d,%d,%d) max_bias=%g logit_softcap=%g\n",
+            GGML_LOG_INFO("ggml_opencl: replay-attn check q=(%d,%d,%d,%d,%d) k=(%d,%d,%d,%d,%d) v_type=%d mask=%d sinks=%d contig(q,k,v,o)=(%d,%d,%d,%d) max_bias=%g logit_softcap=%g\n",
                           (int) q->type, n_q, d_head_q, n_head, n_batch,
                           (int) k->type, n_kv, (int) k->ne[0], n_head_kv, (int) k->ne[3],
                           (int) v->type, mask != nullptr, sinks != nullptr,
@@ -9642,23 +9680,23 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                           (double) max_bias, (double) logit_softcap);
         }
     }
-    const bool mldrift_shape_supported_h24 =
-        (n_q == ggml_opencl_mldrift_h24_m4352::kShapeM) ||
-        (mldrift_dynamic_4352 &&
+    const bool replay_shape_supported_h24 =
+        (n_q == ggml_opencl_replay_h24_m4352::kShapeM) ||
+        (replay_dynamic_4352 &&
          n_q > 0 &&
-         n_q < ggml_opencl_mldrift_h24_m4352::kShapeM &&
+         n_q < ggml_opencl_replay_h24_m4352::kShapeM &&
          (n_q % 128) == 0);
 
-    const bool mldrift_shape_match_h24 =
+    const bool replay_shape_match_h24 =
         backend_ctx->gpu_family == ADRENO &&
         is_mixed && v->type == GGML_TYPE_F16 &&
         mask == nullptr && sinks == nullptr &&
         n_batch == 1 &&
-        n_head == ggml_opencl_mldrift_h24_m4352::kShapeH &&
+        n_head == ggml_opencl_replay_h24_m4352::kShapeH &&
         n_head_kv == n_head &&
-        mldrift_shape_supported_h24 &&
+        replay_shape_supported_h24 &&
         n_kv == n_q &&
-        d_head_q == ggml_opencl_mldrift_h24_m4352::kShapeK &&
+        d_head_q == ggml_opencl_replay_h24_m4352::kShapeK &&
         d_head_v == d_head_q &&
         ggml_is_contiguous(q) &&
         ggml_is_contiguous(k) &&
@@ -9666,33 +9704,33 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         ggml_is_contiguous(dst) &&
         std::abs(max_bias) <= 1e-6f &&
         std::abs(logit_softcap) <= 1e-6f;
-    const bool mldrift_shape_supported_h30 =
+    const bool replay_shape_supported_h30 =
         n_q > 0 &&
-        n_q <= ggml_opencl_mldrift_h30_m4224::kShapeM &&
+        n_q <= ggml_opencl_replay_h30_m4224::kShapeM &&
         (n_q % 4) == 0;
-    const bool mldrift_h30_mask_compatible =
+    const bool replay_h30_mask_compatible =
         (mask == nullptr) ||
-        (n_kv == ggml_opencl_mldrift_h30_m4224::kShapeN + 128);
-    const bool mldrift_h30_kv_supported =
+        (n_kv == ggml_opencl_replay_h30_m4224::kShapeN + 128);
+    const bool replay_h30_kv_supported =
         // Native replay shape.
-        (n_kv == ggml_opencl_mldrift_h30_m4224::kShapeN) ||
+        (n_kv == ggml_opencl_replay_h30_m4224::kShapeN) ||
         // Common text-extended mask case (N + 128).
-        (n_kv == ggml_opencl_mldrift_h30_m4224::kShapeN + 128) ||
+        (n_kv == ggml_opencl_replay_h30_m4224::kShapeN + 128) ||
         // Unmasked dynamic case (e.g. 4096x4096 in z-image).
         (mask == nullptr &&
          n_kv > 0 &&
-         n_kv <= ggml_opencl_mldrift_h30_m4224::kShapeN &&
+         n_kv <= ggml_opencl_replay_h30_m4224::kShapeN &&
          (n_kv % 4) == 0);
-    const bool mldrift_shape_match_h30 =
+    const bool replay_shape_match_h30 =
         backend_ctx->gpu_family == ADRENO &&
         is_mixed && v->type == GGML_TYPE_F16 &&
-        mldrift_h30_mask_compatible && sinks == nullptr &&
+        replay_h30_mask_compatible && sinks == nullptr &&
         n_batch == 1 &&
-        n_head == ggml_opencl_mldrift_h30_m4224::kShapeH &&
+        n_head == ggml_opencl_replay_h30_m4224::kShapeH &&
         n_head_kv == n_head &&
-        mldrift_shape_supported_h30 &&
-        mldrift_h30_kv_supported &&
-        d_head_q == ggml_opencl_mldrift_h30_m4224::kShapeK &&
+        replay_shape_supported_h30 &&
+        replay_h30_kv_supported &&
+        d_head_q == ggml_opencl_replay_h30_m4224::kShapeK &&
         d_head_v == d_head_q &&
         ggml_is_contiguous(q) &&
         ggml_is_contiguous(k) &&
@@ -9700,9 +9738,9 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         ggml_is_contiguous(dst) &&
         std::abs(max_bias) <= 1e-6f &&
         std::abs(logit_softcap) <= 1e-6f;
-    const bool mldrift_shape_match = mldrift_shape_match_h24 || mldrift_shape_match_h30;
-    if (use_mldrift && mldrift_debug_all) {
-        GGML_LOG_INFO("ggml_opencl: mldrift call id=%d qtype=%s ktype=%s vtype=%s mixed=%d n_q=%d n_kv=%d d=%d h=%d h_kv=%d b=%d mask=%d sinks=%d contig(q,k,v,o)=(%d,%d,%d,%d) bias=%g softcap=%g match_h24=%d match_h30=%d\n",
+    const bool replay_shape_match = replay_shape_match_h24 || replay_shape_match_h30;
+    if (use_replay_fa && replay_debug_all) {
+        GGML_LOG_INFO("ggml_opencl: replay-attn call id=%d qtype=%s ktype=%s vtype=%s mixed=%d n_q=%d n_kv=%d d=%d h=%d h_kv=%d b=%d mask=%d sinks=%d contig(q,k,v,o)=(%d,%d,%d,%d) bias=%g softcap=%g match_h24=%d match_h30=%d\n",
                       flash_call_id,
                       ggml_type_name(q->type), ggml_type_name(k->type), ggml_type_name(v->type), is_mixed ? 1 : 0,
                       n_q, n_kv, d_head_q, n_head, n_head_kv, n_batch,
@@ -9712,15 +9750,15 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                       ggml_is_contiguous(v) ? 1 : 0,
                       ggml_is_contiguous(dst) ? 1 : 0,
                       (double) max_bias, (double) logit_softcap,
-                      mldrift_shape_match_h24 ? 1 : 0,
-                      mldrift_shape_match_h30 ? 1 : 0);
+                      replay_shape_match_h24 ? 1 : 0,
+                      replay_shape_match_h30 ? 1 : 0);
     }
 
-    if (use_mldrift && mldrift_shape_match) {
-        if (mldrift_shape_match_h24) {
-            namespace mh = ggml_opencl_mldrift_h24_m4352;
-            if (mldrift_attn_init_h24(backend_ctx, n_q)) {
-                auto & st = backend_ctx->mldrift_attn_h24;
+    if (use_replay_fa && replay_shape_match) {
+        if (replay_shape_match_h24) {
+            namespace mh = ggml_opencl_replay_h24_m4352;
+            if (replay_attn_init_h24(backend_ctx, n_q)) {
+                auto & st = backend_ctx->replay_attn_h24;
 
             const size_t q_bytes = ggml_nbytes(q);
             const size_t k_bytes = ggml_nbytes(k);
@@ -9731,17 +9769,17 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                 out_bytes <= mh::kBufferSizes[mh::kOutputBufId] &&
                 k_bytes * 2 <= mh::kBufferSizes[mh::kInputBufIds[1]] &&
                 v_bytes * 2 <= mh::kBufferSizes[mh::kInputBufIds[2]]) {
-                if (!mldrift_attn_patch_shape_h24(backend_ctx, n_q)) {
-                    if (mldrift_debug_all) {
-                        GGML_LOG_WARN("ggml_opencl: mldrift dynamic shape patch failed for M=%d, fallback to native flash\n", n_q);
+                if (!replay_attn_patch_shape_h24(backend_ctx, n_q)) {
+                    if (replay_debug_all) {
+                        GGML_LOG_WARN("ggml_opencl: replay-attn dynamic shape patch failed for M=%d, fallback to native flash\n", n_q);
                     }
-                    goto mldrift_fallback;
+                    goto replay_fallback;
                 }
 
                 int q_dst_id = mh::kInputBufIds[0];
                 int k_dst_id = mh::kInputBufIds[1];
                 int v_dst_id = mh::kInputBufIds[2];
-                if (const char * map = std::getenv("GGML_OPENCL_MLDRIFT_INPUT_MAP")) {
+                if (const char * map = ggml_opencl_env_value2("GGML_OPENCL_REPLAY_INPUT_MAP", "GGML_OPENCL_MLDRIFT_INPUT_MAP")) {
                     // Optional debug override, e.g. "687" means q->6, k->8, v->7.
                     if (std::strlen(map) >= 3) {
                         const int a = map[0] - '0';
@@ -9760,9 +9798,9 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                 const int q_elems = (int) (q_bytes / sizeof(float));
                 const int kv_elems = (int) (k_bytes / sizeof(uint16_t));
                 // Prefer the stable replay-compatible defaults; legacy behavior stays opt-in.
-                const bool force_no_scale = std::getenv("GGML_OPENCL_MLDRIFT_NO_SCALE") != nullptr;
+                const bool force_no_scale = ggml_opencl_env_flag2("GGML_OPENCL_REPLAY_NO_SCALE", "GGML_OPENCL_MLDRIFT_NO_SCALE");
                 float q_scale_mul = 1.0f;
-                if (const char * q_scale_mul_env = std::getenv("GGML_OPENCL_MLDRIFT_Q_SCALE_MUL")) {
+                if (const char * q_scale_mul_env = ggml_opencl_env_value2("GGML_OPENCL_REPLAY_Q_SCALE_MUL", "GGML_OPENCL_MLDRIFT_Q_SCALE_MUL")) {
                     q_scale_mul = strtof(q_scale_mul_env, nullptr);
                     if (!std::isfinite(q_scale_mul) || q_scale_mul <= 0.0f) {
                         q_scale_mul = 1.0f;
@@ -9770,16 +9808,16 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                 }
                 const float q_scale = force_no_scale ? 1.0f : (scale * q_scale_mul);
                 const cl_ulong zero_offset = 0;
-                const bool mldrift_phase_timing = std::getenv("GGML_OPENCL_MLDRIFT_PHASE_TIMING") != nullptr;
+                const bool replay_phase_timing = ggml_opencl_env_flag2("GGML_OPENCL_REPLAY_PHASE_TIMING", "GGML_OPENCL_MLDRIFT_PHASE_TIMING");
                 const auto now_ms = []() -> double {
                     using clock = std::chrono::steady_clock;
                     return std::chrono::duration<double, std::milli>(clock::now().time_since_epoch()).count();
                 };
-                if (mldrift_phase_timing) {
+                if (replay_phase_timing) {
                     // Isolate per-call phase timing from previous queued work.
                     CL_CHECK(clFinish(backend_ctx->queue));
                 }
-                const double t_phase_start = mldrift_phase_timing ? now_ms() : 0.0;
+                const double t_phase_start = replay_phase_timing ? now_ms() : 0.0;
 
                 // Fast path: when scale is exactly 1, avoid the extra scale kernel and use a raw buffer copy.
                 if (q_scale == 1.0f) {
@@ -9808,7 +9846,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                     backend_ctx->enqueue_ndrange_kernel(copy_scale, 1, global_work_size, local_work_size, dst);
                 }
                 double t_after_q = 0.0;
-                if (mldrift_phase_timing) {
+                if (replay_phase_timing) {
                     CL_CHECK(clFinish(backend_ctx->queue));
                     t_after_q = now_ms();
                 }
@@ -9835,18 +9873,18 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                     backend_ctx->enqueue_ndrange_kernel(convert, 1, global_work_size, local_work_size, dst);
                 }
                 double t_after_prep = 0.0;
-                if (mldrift_phase_timing) {
+                if (replay_phase_timing) {
                     CL_CHECK(clFinish(backend_ctx->queue));
                     t_after_prep = now_ms();
                 }
 
                 static const int alt_run_order[] = {7, 8, 9, 0, 1, 2, 3, 4, 5, 6, 10};
-                const bool legacy_run_order = std::getenv("GGML_OPENCL_MLDRIFT_LEGACY_RUN_ORDER") != nullptr;
+                const bool legacy_run_order = ggml_opencl_env_flag2("GGML_OPENCL_REPLAY_LEGACY_RUN_ORDER", "GGML_OPENCL_MLDRIFT_LEGACY_RUN_ORDER");
                 const int * run_order = legacy_run_order ? mh::kRunOrder : alt_run_order;
                 const int run_order_n = legacy_run_order ? (int) (sizeof(mh::kRunOrder) / sizeof(mh::kRunOrder[0]))
                                                          : (int) (sizeof(alt_run_order) / sizeof(alt_run_order[0]));
                 size_t kernel_gws[mh::kNumKernels][3];
-                mldrift_attn_patch_gws_h24(kernel_gws, n_q);
+                replay_attn_patch_gws_h24(kernel_gws, n_q);
 
                 for (int rid = 0; rid < run_order_n; ++rid) {
                     const int kid = run_order[rid];
@@ -9863,20 +9901,20 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                     backend_ctx->enqueue_ndrange_kernel(st.kernels[kid], 3, global_work_size, local_work_size, dst);
                 }
                 double t_after_main = 0.0;
-                if (mldrift_phase_timing) {
+                if (replay_phase_timing) {
                     CL_CHECK(clFinish(backend_ctx->queue));
                     t_after_main = now_ms();
                 }
 
                 int out_src_id = mh::kOutputBufId;
-                if (const char * out_env = std::getenv("GGML_OPENCL_MLDRIFT_OUTPUT_BUF")) {
+                if (const char * out_env = ggml_opencl_env_value2("GGML_OPENCL_REPLAY_OUTPUT_BUF", "GGML_OPENCL_MLDRIFT_OUTPUT_BUF")) {
                     const int v = out_env[0] - '0';
                     if (v >= 0 && v < mh::kNumBuffers) {
                         out_src_id = v;
                     }
                 }
 
-                const bool disable_reorder = std::getenv("GGML_OPENCL_MLDRIFT_NO_REORDER_OUT") != nullptr;
+                const bool disable_reorder = ggml_opencl_env_flag2("GGML_OPENCL_REPLAY_NO_REORDER_OUT", "GGML_OPENCL_MLDRIFT_NO_REORDER_OUT");
                 const bool apply_reorder = (out_src_id == mh::kOutputBufId) && !disable_reorder;
                 if (apply_reorder) {
                     cl_kernel reorder = backend_ctx->kernel_f32_reorder_hqd_to_qhd;
@@ -9905,7 +9943,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                         nullptr,
                         nullptr));
                 }
-                if (mldrift_phase_timing) {
+                if (replay_phase_timing) {
                     CL_CHECK(clFinish(backend_ctx->queue));
                     const double t_after_out = now_ms();
                     static std::mutex timing_mu;
@@ -9942,24 +9980,24 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                         out_avg = out_ms_sum / call_id;
                     }
                     if (call_id % 25 == 0) {
-                        GGML_LOG_INFO("ggml_opencl: mldrift phase timing calls=%d q=%.3fms kv=%.3fms prep=%.3fms main=%.3fms out=%.3fms total=%.3fms\n",
+                        GGML_LOG_INFO("ggml_opencl: replay-attn phase timing calls=%d q=%.3fms kv=%.3fms prep=%.3fms main=%.3fms out=%.3fms total=%.3fms\n",
                                       call_id, q_avg, kv_avg, prep_avg, main_avg, out_avg, prep_avg + main_avg + out_avg);
                     }
                 }
                 if (flash_dump_this_call) {
                     CL_CHECK(clFinish(backend_ctx->queue));
                     ggml_cl_dump_buffer_region(backend_ctx, extra_o->data_device, offset_o, out_bytes,
-                                               std::string(flash_dump_dir) + "/flash_call" + std::to_string(flash_dump_call) + "_out_mldrift_f32.bin");
+                                               std::string(flash_dump_dir) + "/flash_call" + std::to_string(flash_dump_call) + "_out_replay_f32.bin");
                 }
                 return;
             }
-            } else if (mldrift_debug_all) {
-                GGML_LOG_WARN("ggml_opencl: mldrift(h24) init failed, fallback to native flash\n");
+            } else if (replay_debug_all) {
+                GGML_LOG_WARN("ggml_opencl: replay-attn(h24) init failed, fallback to native flash\n");
             }
-        } else if (mldrift_shape_match_h30) {
-            namespace mh = ggml_opencl_mldrift_h30_m4224;
-            if (mldrift_attn_init_h30(backend_ctx)) {
-                auto & st = backend_ctx->mldrift_attn_h30;
+        } else if (replay_shape_match_h30) {
+            namespace mh = ggml_opencl_replay_h30_m4224;
+            if (replay_attn_init_h30(backend_ctx)) {
+                auto & st = backend_ctx->replay_attn_h30;
                 const size_t q_bytes = ggml_nbytes(q);
                 const size_t k_bytes = ggml_nbytes(k);
                 const size_t v_bytes = ggml_nbytes(v);
@@ -9967,14 +10005,14 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                 const int kv_n_src = n_kv;
                 const int kv_n_dst = (kv_n_src == mh::kShapeN + 128) ? mh::kShapeN : kv_n_src;
                 const bool need_kv_crop = kv_n_src != kv_n_dst;
-                if (!mldrift_attn_patch_shape_h30(backend_ctx, n_q, kv_n_dst)) {
-                    if (mldrift_debug_all) {
-                        GGML_LOG_WARN("ggml_opencl: mldrift(h30) dynamic shape patch failed for M=%d N=%d, fallback to native flash\n", n_q, kv_n_dst);
+                if (!replay_attn_patch_shape_h30(backend_ctx, n_q, kv_n_dst)) {
+                    if (replay_debug_all) {
+                        GGML_LOG_WARN("ggml_opencl: replay-attn(h30) dynamic shape patch failed for M=%d N=%d, fallback to native flash\n", n_q, kv_n_dst);
                     }
-                    goto mldrift_fallback;
+                    goto replay_fallback;
                 }
-                if (mask != nullptr && mldrift_debug_all) {
-                    GGML_LOG_INFO("ggml_opencl: mldrift(h30) using kv-crop fast path with mask present (n_q=%d n_kv=%d)\n", n_q, n_kv);
+                if (mask != nullptr && replay_debug_all) {
+                    GGML_LOG_INFO("ggml_opencl: replay-attn(h30) using kv-crop fast path with mask present (n_q=%d n_kv=%d)\n", n_q, n_kv);
                 }
                 const size_t kv_dst_bytes = (size_t) d_head_q * (size_t) n_head * (size_t) kv_n_dst * sizeof(float);
                 const size_t k_work_bytes = need_kv_crop ? kv_dst_bytes : (k_bytes * 2);
@@ -9986,7 +10024,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                     int q_dst_id = mh::kInputBufIds[0];
                     int k_dst_id = mh::kInputBufIds[1];
                     int v_dst_id = mh::kInputBufIds[2];
-                    if (const char * map = std::getenv("GGML_OPENCL_MLDRIFT_INPUT_MAP")) {
+                    if (const char * map = ggml_opencl_env_value2("GGML_OPENCL_REPLAY_INPUT_MAP", "GGML_OPENCL_MLDRIFT_INPUT_MAP")) {
                         // Optional debug override, e.g. "687" means q->6, k->8, v->7.
                         if (std::strlen(map) >= 3) {
                             const int a = map[0] - '0';
@@ -10002,30 +10040,30 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                             }
                         }
                     }
-                    const bool force_no_scale = std::getenv("GGML_OPENCL_MLDRIFT_NO_SCALE") != nullptr;
+                    const bool force_no_scale = ggml_opencl_env_flag2("GGML_OPENCL_REPLAY_NO_SCALE", "GGML_OPENCL_MLDRIFT_NO_SCALE");
                     float q_scale_mul = 1.0f;
-                    if (const char * q_scale_mul_env = std::getenv("GGML_OPENCL_MLDRIFT_Q_SCALE_MUL")) {
+                    if (const char * q_scale_mul_env = ggml_opencl_env_value2("GGML_OPENCL_REPLAY_Q_SCALE_MUL", "GGML_OPENCL_MLDRIFT_Q_SCALE_MUL")) {
                         q_scale_mul = strtof(q_scale_mul_env, nullptr);
                         if (!std::isfinite(q_scale_mul) || q_scale_mul <= 0.0f) {
                             q_scale_mul = 1.0f;
                         }
                     }
                     const float q_scale = force_no_scale ? 1.0f : (scale * q_scale_mul);
-                    if (mldrift_debug_all && flash_call_id < 16) {
-                        GGML_LOG_INFO("ggml_opencl: mldrift(h30) scales call=%d scale=%g q_scale_mul=%g force_no_scale=%d q_scale=%g\n",
+                    if (replay_debug_all && flash_call_id < 16) {
+                        GGML_LOG_INFO("ggml_opencl: replay-attn(h30) scales call=%d scale=%g q_scale_mul=%g force_no_scale=%d q_scale=%g\n",
                                       flash_call_id, (double) scale, (double) q_scale_mul, force_no_scale ? 1 : 0, (double) q_scale);
                     }
                     const cl_ulong zero_offset = 0;
                     const int q_elems = (int) (q_bytes / sizeof(float));
                     const int kv_elems_src = (int) (k_bytes / sizeof(uint16_t));
                     const int kv_elems_dst = d_head_q * n_head * kv_n_dst;
-                    const bool kv_crop_tail = std::getenv("GGML_OPENCL_MLDRIFT_KV_CROP_TAIL") != nullptr;
+                    const bool kv_crop_tail = ggml_opencl_env_flag2("GGML_OPENCL_REPLAY_KV_CROP_TAIL", "GGML_OPENCL_MLDRIFT_KV_CROP_TAIL");
                     const int kv_src_start = (need_kv_crop && kv_crop_tail) ? (kv_n_src - kv_n_dst) : 0;
-                    const bool has_kv_keep_head = std::getenv("GGML_OPENCL_MLDRIFT_KV_KEEP_HEAD") != nullptr;
-                    const bool has_kv_keep_tail = std::getenv("GGML_OPENCL_MLDRIFT_KV_KEEP_TAIL") != nullptr;
+                    const bool has_kv_keep_head = ggml_opencl_env_flag2("GGML_OPENCL_REPLAY_KV_KEEP_HEAD", "GGML_OPENCL_MLDRIFT_KV_KEEP_HEAD");
+                    const bool has_kv_keep_tail = ggml_opencl_env_flag2("GGML_OPENCL_REPLAY_KV_KEEP_TAIL", "GGML_OPENCL_MLDRIFT_KV_KEEP_TAIL");
                     int kv_keep_head = kv_n_dst;
                     if (has_kv_keep_tail) {
-                        int kv_keep_tail = std::atoi(std::getenv("GGML_OPENCL_MLDRIFT_KV_KEEP_TAIL"));
+                        int kv_keep_tail = std::atoi(ggml_opencl_env_value2("GGML_OPENCL_REPLAY_KV_KEEP_TAIL", "GGML_OPENCL_MLDRIFT_KV_KEEP_TAIL"));
                         if (kv_keep_tail < 0) {
                             kv_keep_tail = 0;
                         } else if (kv_keep_tail > kv_n_dst) {
@@ -10034,7 +10072,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                         kv_keep_head = kv_n_dst - kv_keep_tail;
                     }
                     if (has_kv_keep_head) {
-                        kv_keep_head = std::atoi(std::getenv("GGML_OPENCL_MLDRIFT_KV_KEEP_HEAD"));
+                        kv_keep_head = std::atoi(ggml_opencl_env_value2("GGML_OPENCL_REPLAY_KV_KEEP_HEAD", "GGML_OPENCL_MLDRIFT_KV_KEEP_HEAD"));
                         if (kv_keep_head < 0) {
                             kv_keep_head = 0;
                         } else if (kv_keep_head > kv_n_dst) {
@@ -10042,17 +10080,17 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                         }
                     }
                     const bool use_kv_head_tail_crop = need_kv_crop && (has_kv_keep_head || has_kv_keep_tail);
-                    if (mldrift_debug_all && need_kv_crop) {
-                        GGML_LOG_INFO("ggml_opencl: mldrift(h30) kv crop mode src=%d dst=%d src_start=%d keep_head=%d keep_tail=%d\n",
+                    if (replay_debug_all && need_kv_crop) {
+                        GGML_LOG_INFO("ggml_opencl: replay-attn(h30) kv crop mode src=%d dst=%d src_start=%d keep_head=%d keep_tail=%d\n",
                                       kv_n_src, kv_n_dst, kv_src_start, kv_keep_head, kv_n_dst - kv_keep_head);
                     }
 
                     const size_t q_full_bytes = mh::kBufferSizes[q_dst_id];
                     // The intercepted h30 op schedule is numerically unstable in ggml migration.
                     // Default to simple order (upload q/k/v first, then run kernels 0..10).
-                    const bool force_h30_simple_order = std::getenv("GGML_OPENCL_MLDRIFT_H30_SIMPLE_ORDER") != nullptr;
-                    const bool force_h30_op_schedule  = std::getenv("GGML_OPENCL_MLDRIFT_H30_OP_SCHEDULE") != nullptr;
-                    const bool force_h30_io_first     = std::getenv("GGML_OPENCL_MLDRIFT_H30_IO_FIRST") != nullptr;
+                    const bool force_h30_simple_order = ggml_opencl_env_flag2("GGML_OPENCL_REPLAY_H30_SIMPLE_ORDER", "GGML_OPENCL_MLDRIFT_H30_SIMPLE_ORDER");
+                    const bool force_h30_op_schedule  = ggml_opencl_env_flag2("GGML_OPENCL_REPLAY_H30_OP_SCHEDULE", "GGML_OPENCL_MLDRIFT_H30_OP_SCHEDULE");
+                    const bool force_h30_io_first     = ggml_opencl_env_flag2("GGML_OPENCL_REPLAY_H30_IO_FIRST", "GGML_OPENCL_MLDRIFT_H30_IO_FIRST");
                     const bool use_h30_op_schedule    = force_h30_op_schedule && !force_h30_simple_order;
 
                     auto enqueue_q_upload = [&]() {
@@ -10111,8 +10149,8 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                             size_t local_work_size[] = { lws, 1, 1 };
                             backend_ctx->enqueue_ndrange_kernel(convert, 1, global_work_size, local_work_size, dst);
                         } else {
-                            if (mldrift_debug_all) {
-                                GGML_LOG_INFO("ggml_opencl: mldrift(h30) cropping kv from %d to %d tokens\n", kv_n_src, kv_n_dst);
+                            if (replay_debug_all) {
+                                GGML_LOG_INFO("ggml_opencl: replay-attn(h30) cropping kv from %d to %d tokens\n", kv_n_src, kv_n_dst);
                             }
                             cl_kernel convert_crop = use_kv_head_tail_crop
                                 ? backend_ctx->kernel_f16_to_f32_nhd_keep_head_tail
@@ -10169,7 +10207,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                     };
 
                     size_t kernel_gws[mh::kNumKernels][3];
-                    mldrift_attn_patch_gws_h30(kernel_gws, n_q, kv_n_dst);
+                    replay_attn_patch_gws_h30(kernel_gws, n_q, kv_n_dst);
                     auto enqueue_kernel_h30 = [&](int kid) {
                         size_t global_work_size[] = {
                             kernel_gws[kid][0],
@@ -10217,7 +10255,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                         }
                     }
 
-                    const bool disable_reorder = std::getenv("GGML_OPENCL_MLDRIFT_NO_REORDER_OUT") != nullptr;
+                    const bool disable_reorder = ggml_opencl_env_flag2("GGML_OPENCL_REPLAY_NO_REORDER_OUT", "GGML_OPENCL_MLDRIFT_NO_REORDER_OUT");
                     if (!disable_reorder) {
                         cl_kernel reorder = backend_ctx->kernel_f32_reorder_hqd_to_qhd;
                         CL_CHECK(clSetKernelArg(reorder, 0, sizeof(cl_mem), &extra_o->data_device));
@@ -10249,26 +10287,26 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                     if (flash_dump_this_call) {
                         CL_CHECK(clFinish(backend_ctx->queue));
                         ggml_cl_dump_buffer_region(backend_ctx, extra_o->data_device, offset_o, out_bytes,
-                                                   std::string(flash_dump_dir) + "/flash_call" + std::to_string(flash_dump_call) + "_out_mldrift_h30_f32.bin");
+                                                   std::string(flash_dump_dir) + "/flash_call" + std::to_string(flash_dump_call) + "_out_replay_h30_f32.bin");
                     }
-                    if (std::getenv("GGML_OPENCL_MLDRIFT_FORCE_FINISH") != nullptr) {
+                    if (ggml_opencl_env_flag2("GGML_OPENCL_REPLAY_FORCE_FINISH", "GGML_OPENCL_MLDRIFT_FORCE_FINISH")) {
                         CL_CHECK(clFinish(backend_ctx->queue));
                     }
                     return;
-                } else if (mldrift_debug_all) {
-                    GGML_LOG_WARN("ggml_opencl: mldrift(h30) buffer guard fail q=%zu out=%zu k_work=%zu v_work=%zu limits(q=%zu out=%zu k=%zu v=%zu)\n",
+                } else if (replay_debug_all) {
+                    GGML_LOG_WARN("ggml_opencl: replay-attn(h30) buffer guard fail q=%zu out=%zu k_work=%zu v_work=%zu limits(q=%zu out=%zu k=%zu v=%zu)\n",
                                   q_bytes, out_bytes, k_work_bytes, v_work_bytes,
                                   mh::kBufferSizes[mh::kInputBufIds[0]],
                                   mh::kBufferSizes[mh::kOutputBufId],
                                   mh::kBufferSizes[mh::kInputBufIds[1]],
                                   mh::kBufferSizes[mh::kInputBufIds[2]]);
                 }
-            } else if (mldrift_debug_all) {
-                GGML_LOG_WARN("ggml_opencl: mldrift(h30) init failed, fallback to native flash\n");
+            } else if (replay_debug_all) {
+                GGML_LOG_WARN("ggml_opencl: replay-attn(h30) init failed, fallback to native flash\n");
             }
         }
     }
-mldrift_fallback:
+replay_fallback:
 
     // Default to non-causal when no explicit mask is provided.
     // Legacy auto-causal heuristic can be re-enabled with GGML_OPENCL_FLASH_LEGACY_AUTO_CAUSAL=1.
