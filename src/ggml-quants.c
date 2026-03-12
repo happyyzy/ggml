@@ -304,9 +304,76 @@ void quantize_row_mxfp4_ref(const float * GGML_RESTRICT x, block_mxfp4 * GGML_RE
     }
 }
 
+// When GGUF is exported with HMX repack enabled, the on-disk q4/q8 row layout
+// differs from the vanilla ggml block layout (but keeps the same row_size).
+// CPU fallback must decode this layout to remain numerically meaningful.
+static bool ggml_htp_contract_export_repack_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char * env = getenv("GGML_HTP_CONTRACT_EXPORT_REPACK");
+        enabled = (env && env[0] != '\0' && strcmp(env, "0") != 0 && strcmp(env, "false") != 0) ? 1 : 0;
+    }
+    return enabled != 0;
+}
+
+typedef struct {
+    ggml_fp16_t scales[8]; // fp16 scales for 8x q4 blocks (256 values)
+    uint8_t     qs[8 * 16];
+} ggml_hmx_block_q4_0_like;
+static_assert(sizeof(ggml_hmx_block_q4_0_like) == 144, "unexpected hmx q4 super-block size");
+
+typedef struct {
+    ggml_fp16_t scales[8]; // fp16 scales for 8x q8 blocks (256 values)
+    int8_t      qs[8 * 32];
+} ggml_hmx_block_q8_0;
+static_assert(sizeof(ggml_hmx_block_q8_0) == 272, "unexpected hmx q8 super-block size");
+
 void dequantize_row_q4_0(const block_q4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK4_0;
 
+    if (ggml_htp_contract_export_repack_enabled()) {
+        // HMX repacked layout is defined at 256 elements granularity.
+        // If a tensor row does not meet the repack granularity constraint, fall
+        // back to the vanilla ggml layout decode (mixed-layout models exist in
+        // bring-up experiments).
+        if ((k % 256) != 0) {
+            goto vanilla_decode;
+        }
+
+        const int n_sb = (int) (k / 256);
+        const ggml_hmx_block_q4_0_like * sb = (const ggml_hmx_block_q4_0_like *) x;
+        uint8_t unpacked_qs[256];
+
+        for (int si = 0; si < n_sb; ++si) {
+            const ggml_hmx_block_q4_0_like * b = &sb[si];
+
+            // Invert sd_hmx_repack_row_q4_like_inplace() packing to reconstruct
+            // the original 256 q4 nibble sequence (still in the permuted basis).
+            for (int j = 0; j < 64; ++j) {
+                const uint8_t q0 = b->qs[j * 2 + 0];
+                const uint8_t q1 = b->qs[j * 2 + 1];
+
+                unpacked_qs[j + 0]   = q0 & 0x0F;
+                unpacked_qs[j + 128] = q0 >> 4;
+                unpacked_qs[j + 64]  = q1 & 0x0F;
+                unpacked_qs[j + 192] = q1 >> 4;
+            }
+
+            for (int bi = 0; bi < 8; ++bi) {
+                const float d = GGML_FP16_TO_FP32(b->scales[bi]);
+                const int base = si * 256 + bi * 32;
+                for (int j = 0; j < 16; ++j) {
+                    const int x0 = (int) unpacked_qs[bi * 32 + j + 0]  - 8;
+                    const int x1 = (int) unpacked_qs[bi * 32 + j + 16] - 8;
+                    y[base + j + 0]  = x0 * d;
+                    y[base + j + 16] = x1 * d;
+                }
+            }
+        }
+        return;
+    }
+
+vanilla_decode:
     assert(k % qk == 0);
 
     const int nb = k / qk;
@@ -401,6 +468,28 @@ void dequantize_row_q5_1(const block_q5_1 * GGML_RESTRICT x, float * GGML_RESTRI
 void dequantize_row_q8_0(const block_q8_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK8_0;
 
+    if (ggml_htp_contract_export_repack_enabled()) {
+        if ((k % 256) != 0) {
+            goto vanilla_decode;
+        }
+
+        const int n_sb = (int) (k / 256);
+        const ggml_hmx_block_q8_0 * sb = (const ggml_hmx_block_q8_0 *) x;
+
+        for (int si = 0; si < n_sb; ++si) {
+            const ggml_hmx_block_q8_0 * b = &sb[si];
+            for (int bi = 0; bi < 8; ++bi) {
+                const float d = GGML_FP16_TO_FP32(b->scales[bi]);
+                const int base = si * 256 + bi * 32;
+                for (int j = 0; j < 32; ++j) {
+                    y[base + j] = b->qs[bi * 32 + j] * d;
+                }
+            }
+        }
+        return;
+    }
+
+vanilla_decode:
     assert(k % qk == 0);
 
     const int nb = k / qk;

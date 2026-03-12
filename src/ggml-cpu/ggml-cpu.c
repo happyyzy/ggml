@@ -16,6 +16,12 @@
 #include "ggml.h"
 #include "common.h"
 
+#ifdef GGML_USE_HTP
+extern bool ggml_htp_try_compute(struct ggml_compute_params * params, struct ggml_tensor * op);
+extern const char * ggml_htp_take_last_fallback_reason(void);
+extern uint64_t ggml_htp_take_last_copy_bytes(void);
+#endif
+
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
 #elif !defined(__FreeBSD__) && !defined(__NetBSD__) && !defined(__OpenBSD__)
@@ -1675,6 +1681,804 @@ static void ggml_compute_forward_mul_mat_id(
 
 /////////////////////////////////
 
+struct ggml_op_profile_entry {
+    uint64_t calls;
+    uint64_t total_us;
+    uint64_t offload_calls;
+    uint64_t offload_us;
+    uint64_t hmx_calls;
+    uint64_t hmx_us;
+    uint64_t hvx_calls;
+    uint64_t hvx_us;
+    uint64_t htp_calls;
+    uint64_t htp_us;
+    uint64_t cpu_calls;
+    uint64_t cpu_us;
+    uint64_t offload_copy_bytes;
+    uint64_t hmx_copy_bytes;
+    uint64_t hvx_copy_bytes;
+    uint64_t htp_copy_bytes;
+    uint64_t cpu_copy_bytes;
+    struct {
+        char reason[48];
+        uint64_t count;
+    } fallback_reasons[16];
+    int n_fallback_reasons;
+};
+
+#define GGML_OP_PROFILE_SHAPE_CAP 8192
+
+struct ggml_op_profile_shape_entry {
+    enum ggml_op op;
+    char shape[96];
+    char device[8];
+    uint64_t calls;
+    uint64_t total_us;
+};
+
+// Forward declarations (used by GGML_OP_DUMP helpers).
+static const char * ggml_op_profile_device_label(const struct ggml_tensor * t, bool offload);
+static void ggml_op_profile_shape_label(const struct ggml_tensor * t, char * out, size_t out_sz);
+
+// Optional per-op dump for contract validation and debugging.
+//
+// Enabled when GGML_OP_DUMP_DIR is set to a non-empty path. It will dump the
+// *first* occurrence of each (op, shape) pair during graph compute, so that we
+// can compare CPU vs HTP/HMX/HVX outputs offline without exploding dump volume.
+//
+// The dump format matches sd.cpp's `.tensor` format:
+//   int32 n_dims, int32 name_len, int32 ggml_type, int32 ne[0..n_dims)
+//   bytes name[name_len]
+//   bytes raw_data[ggml_nbytes(t)]
+//
+// Output files:
+//   <GGML_OP_DUMP_DIR>/<GGML_OP_DUMP_TAG>_opdump_<seq>.tensor
+//   <GGML_OP_DUMP_DIR>/<GGML_OP_DUMP_TAG>_opdump.csv
+#define GGML_OP_DUMP_CAP 8192
+
+struct ggml_op_dump_entry {
+    enum ggml_op op;
+    char shape[96];
+};
+
+struct ggml_op_dump_state {
+    bool enabled;
+    bool initialized;
+    char dir[768];
+    char tag[96];
+    char csv_path[1024];
+    uint64_t max_total_bytes;
+    uint64_t total_bytes;
+    FILE * csv;
+    struct ggml_op_dump_entry entries[GGML_OP_DUMP_CAP];
+    int n_entries;
+};
+
+static struct ggml_op_dump_state g_ggml_op_dump = { 0 };
+
+static bool ggml_op_dump_enabled(void) {
+    if (g_ggml_op_dump.initialized) {
+        return g_ggml_op_dump.enabled;
+    }
+
+    g_ggml_op_dump.initialized = true;
+    g_ggml_op_dump.enabled = false;
+    g_ggml_op_dump.csv = NULL;
+    g_ggml_op_dump.n_entries = 0;
+    g_ggml_op_dump.total_bytes = 0;
+    g_ggml_op_dump.max_total_bytes = 0;
+    g_ggml_op_dump.dir[0] = '\0';
+    g_ggml_op_dump.tag[0] = '\0';
+    g_ggml_op_dump.csv_path[0] = '\0';
+
+    const char * dir = getenv("GGML_OP_DUMP_DIR");
+    if (dir == NULL || dir[0] == '\0') {
+        return false;
+    }
+    snprintf(g_ggml_op_dump.dir, sizeof(g_ggml_op_dump.dir), "%s", dir);
+
+    const char * tag = getenv("GGML_OP_DUMP_TAG");
+    if (tag == NULL || tag[0] == '\0') {
+        tag = "ggml";
+    }
+    snprintf(g_ggml_op_dump.tag, sizeof(g_ggml_op_dump.tag), "%s", tag);
+
+    const char * csv_path = getenv("GGML_OP_DUMP_CSV");
+    if (csv_path != NULL && csv_path[0] != '\0') {
+        snprintf(g_ggml_op_dump.csv_path, sizeof(g_ggml_op_dump.csv_path), "%s", csv_path);
+    } else {
+        snprintf(g_ggml_op_dump.csv_path, sizeof(g_ggml_op_dump.csv_path), "%s/%s_opdump.csv", g_ggml_op_dump.dir, g_ggml_op_dump.tag);
+    }
+
+    const char * max_bytes = getenv("GGML_OP_DUMP_MAX_TOTAL_BYTES");
+    if (max_bytes != NULL && max_bytes[0] != '\0') {
+        // Accept decimal or float-like strings (same as other env parsing in this file).
+        const double v = strtod(max_bytes, NULL);
+        if (v > 0) {
+            g_ggml_op_dump.max_total_bytes = (uint64_t) v;
+        }
+    }
+
+    g_ggml_op_dump.enabled = true;
+    return true;
+}
+
+static bool ggml_op_dump_seen(enum ggml_op op, const char * shape) {
+    for (int i = 0; i < g_ggml_op_dump.n_entries; ++i) {
+        const struct ggml_op_dump_entry * e = &g_ggml_op_dump.entries[i];
+        if (e->op == op && strcmp(e->shape, shape) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void ggml_op_dump_mark_seen(enum ggml_op op, const char * shape) {
+    if (g_ggml_op_dump.n_entries >= GGML_OP_DUMP_CAP) {
+        return;
+    }
+    struct ggml_op_dump_entry * e = &g_ggml_op_dump.entries[g_ggml_op_dump.n_entries++];
+    e->op = op;
+    snprintf(e->shape, sizeof(e->shape), "%s", shape);
+}
+
+static void ggml_op_dump_ensure_csv_open(void) {
+    if (!ggml_op_dump_enabled() || g_ggml_op_dump.csv != NULL) {
+        return;
+    }
+
+    g_ggml_op_dump.csv = fopen(g_ggml_op_dump.csv_path, "w");
+    if (g_ggml_op_dump.csv == NULL) {
+        // If the CSV cannot be opened, disable dumping to avoid spamming stderr.
+        fprintf(stderr, "GGML_OP_DUMP: failed to open csv path '%s' (%s)\n", g_ggml_op_dump.csv_path, strerror(errno));
+        g_ggml_op_dump.enabled = false;
+        return;
+    }
+
+    fprintf(g_ggml_op_dump.csv, "seq,op,shape,device,ggml_type,ne0,ne1,ne2,ne3,n_dims,nbytes,tensor_name,file\n");
+    fflush(g_ggml_op_dump.csv);
+}
+
+static bool ggml_op_dump_tensor_to_file(const char * path, const struct ggml_tensor * t) {
+    if (t == NULL || path == NULL || path[0] == '\0') {
+        return false;
+    }
+
+    FILE * f = fopen(path, "wb");
+    if (f == NULL) {
+        fprintf(stderr, "GGML_OP_DUMP: failed to open '%s' (%s)\n", path, strerror(errno));
+        return false;
+    }
+
+    const int32_t n_dims = (int32_t) ggml_n_dims(t);
+    const char * name = (t->name[0] != '\0') ? t->name : NULL;
+    const int32_t name_len = name ? (int32_t) strlen(name) : 0;
+    const int32_t ttype = (int32_t) t->type;
+
+    fwrite(&n_dims, sizeof(n_dims), 1, f);
+    fwrite(&name_len, sizeof(name_len), 1, f);
+    fwrite(&ttype, sizeof(ttype), 1, f);
+    for (int i = 0; i < n_dims; ++i) {
+        const int32_t ne = (int32_t) t->ne[i];
+        fwrite(&ne, sizeof(ne), 1, f);
+    }
+    if (name_len > 0) {
+        fwrite(name, 1, (size_t) name_len, f);
+    }
+
+    const size_t nbytes = ggml_nbytes(t);
+    const size_t k_chunk = 4u * 1024u * 1024u;
+    uint8_t * tmp = NULL;
+
+    if (t->data != NULL) {
+        fwrite(t->data, 1, nbytes, f);
+    } else if (t->buffer != NULL) {
+        tmp = (uint8_t *) malloc(k_chunk);
+        if (tmp == NULL) {
+            fclose(f);
+            fprintf(stderr, "GGML_OP_DUMP: OOM allocating %zu bytes for '%s'\n", k_chunk, path);
+            return false;
+        }
+        for (size_t off = 0; off < nbytes; off += k_chunk) {
+            const size_t sz = (off + k_chunk <= nbytes) ? k_chunk : (nbytes - off);
+            ggml_backend_tensor_get(t, tmp, off, sz);
+            fwrite(tmp, 1, sz, f);
+        }
+    } else {
+        fclose(f);
+        fprintf(stderr, "GGML_OP_DUMP: tensor has no data/buffer for '%s'\n", path);
+        free(tmp);
+        return false;
+    }
+
+    fflush(f);
+    fclose(f);
+    free(tmp);
+    return true;
+}
+
+static void ggml_op_dump_record(const struct ggml_tensor * t, bool offload) {
+    if (!ggml_op_dump_enabled() || t == NULL) {
+        return;
+    }
+
+    if (g_ggml_op_dump.max_total_bytes > 0 && g_ggml_op_dump.total_bytes >= g_ggml_op_dump.max_total_bytes) {
+        return;
+    }
+
+    char shape[96] = { 0 };
+    ggml_op_profile_shape_label(t, shape, sizeof(shape));
+    if (shape[0] == '\0') {
+        return;
+    }
+
+    if (ggml_op_dump_seen(t->op, shape)) {
+        return;
+    }
+
+    ggml_op_dump_ensure_csv_open();
+    if (!ggml_op_dump_enabled() || g_ggml_op_dump.csv == NULL) {
+        return;
+    }
+
+    // Mark seen early to keep deterministic "first occurrence" semantics even if dumping fails.
+    ggml_op_dump_mark_seen(t->op, shape);
+    const int seq = g_ggml_op_dump.n_entries;
+
+    char tensor_path[1024] = { 0 };
+    snprintf(tensor_path, sizeof(tensor_path), "%s/%s_opdump_%06d.tensor", g_ggml_op_dump.dir, g_ggml_op_dump.tag, seq);
+
+    const char * device = ggml_op_profile_device_label(t, offload);
+    const int32_t n_dims = (int32_t) ggml_n_dims(t);
+    const size_t nbytes = ggml_nbytes(t);
+    const char * tname = (t->name[0] != '\0') ? t->name : "-";
+
+    const bool ok = ggml_op_dump_tensor_to_file(tensor_path, t);
+    if (ok) {
+        g_ggml_op_dump.total_bytes += (uint64_t) nbytes;
+    }
+
+    fprintf(g_ggml_op_dump.csv,
+            "%d,%s,%s,%s,%d,%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 ",%d,%zu,%s,%s\n",
+            seq,
+            ggml_op_name(t->op),
+            shape,
+            device,
+            (int) t->type,
+            t->ne[0], t->ne[1], t->ne[2], t->ne[3],
+            (int) n_dims,
+            nbytes,
+            tname,
+            ok ? tensor_path : "<dump_failed>");
+    fflush(g_ggml_op_dump.csv);
+}
+
+struct ggml_op_profile_state {
+    bool enabled;
+    bool initialized;
+    bool registered;
+    int  top_n;
+    char csv_path[512];
+    char detail_csv_path[512];
+    char shape_csv_path[512];
+    struct ggml_op_profile_entry entries[GGML_OP_COUNT];
+    struct ggml_op_profile_shape_entry shape_entries[GGML_OP_PROFILE_SHAPE_CAP];
+    int n_shape_entries;
+};
+
+static struct ggml_op_profile_state g_ggml_op_profile = { 0 };
+
+enum ggml_profile_device_kind {
+    GGML_PROFILE_DEVICE_CPU = 0,
+    GGML_PROFILE_DEVICE_HMX,
+    GGML_PROFILE_DEVICE_HVX,
+    GGML_PROFILE_DEVICE_HTP,
+};
+
+static enum ggml_profile_device_kind ggml_op_profile_device_kind(const struct ggml_tensor * t, bool offload) {
+    if (!offload) {
+        return GGML_PROFILE_DEVICE_CPU;
+    }
+
+    if (!t) {
+        return GGML_PROFILE_DEVICE_HTP;
+    }
+
+    switch (t->op) {
+        case GGML_OP_MUL_MAT:
+            return GGML_PROFILE_DEVICE_HMX;
+        case GGML_OP_FLASH_ATTN_EXT:
+            return GGML_PROFILE_DEVICE_HVX;
+        default:
+            return GGML_PROFILE_DEVICE_HTP;
+    }
+}
+
+static const char * ggml_op_profile_device_label_from_kind(enum ggml_profile_device_kind kind) {
+    switch (kind) {
+        case GGML_PROFILE_DEVICE_CPU: return "CPU";
+        case GGML_PROFILE_DEVICE_HMX: return "HMX";
+        case GGML_PROFILE_DEVICE_HVX: return "HVX";
+        case GGML_PROFILE_DEVICE_HTP: return "HTP";
+        default: return "UNK";
+    }
+}
+
+static const char * ggml_op_profile_device_label(const struct ggml_tensor * t, bool offload) {
+    return ggml_op_profile_device_label_from_kind(ggml_op_profile_device_kind(t, offload));
+}
+
+static void ggml_op_profile_record_fallback_reason(struct ggml_op_profile_entry * e, const char * reason) {
+    if (!e || !reason || reason[0] == '\0') {
+        return;
+    }
+
+    for (int i = 0; i < e->n_fallback_reasons; ++i) {
+        if (strcmp(e->fallback_reasons[i].reason, reason) == 0) {
+            e->fallback_reasons[i].count += 1;
+            return;
+        }
+    }
+
+    if (e->n_fallback_reasons >= (int) (sizeof(e->fallback_reasons) / sizeof(e->fallback_reasons[0]))) {
+        return;
+    }
+
+    snprintf(e->fallback_reasons[e->n_fallback_reasons].reason,
+             sizeof(e->fallback_reasons[e->n_fallback_reasons].reason),
+             "%s", reason);
+    e->fallback_reasons[e->n_fallback_reasons].count = 1;
+    e->n_fallback_reasons += 1;
+}
+
+static void ggml_op_profile_fallback_summary(const struct ggml_op_profile_entry * e, char * out, size_t out_sz) {
+    if (!e || !out || out_sz == 0) {
+        return;
+    }
+
+    out[0] = '\0';
+    for (int i = 0; i < e->n_fallback_reasons; ++i) {
+        char item[96];
+        snprintf(item, sizeof(item), "%s:%" PRIu64,
+                 e->fallback_reasons[i].reason, e->fallback_reasons[i].count);
+        const size_t cur = strlen(out);
+        if (cur + strlen(item) + 2 >= out_sz) {
+            break;
+        }
+        if (cur > 0) {
+            strcat(out, "|");
+        }
+        strcat(out, item);
+    }
+}
+
+static void ggml_op_profile_shape_label(const struct ggml_tensor * t, char * out, size_t out_sz) {
+    if (!t || out_sz == 0) {
+        return;
+    }
+
+    if (t->op == GGML_OP_MUL_MAT && t->src[0] && t->src[1]) {
+        const struct ggml_tensor * weight = t->src[0];
+        const struct ggml_tensor * act = t->src[1];
+        const int64_t m = ggml_nrows(act);
+        const int64_t k = weight->ne[0];
+        const int64_t n = weight->ne[1];
+        snprintf(out, out_sz, "m=%" PRId64 ",k=%" PRId64 ",n=%" PRId64, m, k, n);
+        return;
+    }
+
+    if (t->op == GGML_OP_FLASH_ATTN_EXT && t->src[0] && t->src[1]) {
+        const struct ggml_tensor * q = t->src[0];
+        const struct ggml_tensor * k = t->src[1];
+        snprintf(out, out_sz, "Lq=%" PRId64 ",Lk=%" PRId64 ",H=%" PRId64 ",D=%" PRId64,
+                 q->ne[2], k->ne[2], q->ne[1], q->ne[0]);
+        return;
+    }
+
+    snprintf(out, out_sz, "%" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64,
+             t->ne[0], t->ne[1], t->ne[2], t->ne[3]);
+}
+
+static inline void ggml_op_profile_shape_record(const struct ggml_tensor * t, uint64_t us, bool offload) {
+    if (!g_ggml_op_profile.enabled || !t) {
+        return;
+    }
+
+    if (g_ggml_op_profile.n_shape_entries >= GGML_OP_PROFILE_SHAPE_CAP) {
+        return;
+    }
+
+    char shape[96] = { 0 };
+    char device[8] = { 0 };
+    ggml_op_profile_shape_label(t, shape, sizeof(shape));
+    snprintf(device, sizeof(device), "%s", ggml_op_profile_device_label(t, offload));
+
+    for (int i = 0; i < g_ggml_op_profile.n_shape_entries; ++i) {
+        struct ggml_op_profile_shape_entry * e = &g_ggml_op_profile.shape_entries[i];
+        if (e->op == t->op && strcmp(e->shape, shape) == 0 && strcmp(e->device, device) == 0) {
+            e->calls += 1;
+            e->total_us += us;
+            return;
+        }
+    }
+
+    struct ggml_op_profile_shape_entry * e = &g_ggml_op_profile.shape_entries[g_ggml_op_profile.n_shape_entries++];
+    e->op = t->op;
+    snprintf(e->shape, sizeof(e->shape), "%s", shape);
+    snprintf(e->device, sizeof(e->device), "%s", device);
+    e->calls = 1;
+    e->total_us = us;
+}
+
+static void ggml_op_profile_dump(void) {
+    if (!g_ggml_op_profile.enabled) {
+        return;
+    }
+
+    int idxs[GGML_OP_COUNT];
+    int n_rows = 0;
+
+    uint64_t total_calls = 0;
+    uint64_t total_us = 0;
+    uint64_t total_offload_us = 0;
+    uint64_t total_cpu_us = 0;
+    const char * contract_id = getenv("GGML_HTP_CONTRACT_ACTIVE");
+    if (contract_id == NULL || contract_id[0] == '\0') {
+        contract_id = getenv("GGML_HTP_CONTRACT_EXPECT");
+    }
+    if (contract_id == NULL || contract_id[0] == '\0') {
+        contract_id = "<unset>";
+    }
+
+    for (int op = 0; op < GGML_OP_COUNT; ++op) {
+        const struct ggml_op_profile_entry * e = &g_ggml_op_profile.entries[op];
+        if (e->calls == 0) {
+            continue;
+        }
+        idxs[n_rows++] = op;
+        total_calls += e->calls;
+        total_us += e->total_us;
+        total_offload_us += e->offload_us;
+        total_cpu_us += e->cpu_us;
+    }
+
+    for (int i = 0; i < n_rows; ++i) {
+        for (int j = i + 1; j < n_rows; ++j) {
+            if (g_ggml_op_profile.entries[idxs[j]].total_us > g_ggml_op_profile.entries[idxs[i]].total_us) {
+                SWAP(idxs[i], idxs[j], int);
+            }
+        }
+    }
+
+    int n_print = n_rows;
+    if (g_ggml_op_profile.top_n > 0 && g_ggml_op_profile.top_n < n_print) {
+        n_print = g_ggml_op_profile.top_n;
+    }
+
+    fprintf(stderr,
+            "GGML_OP_PROFILE: total_calls=%" PRIu64 " total_time=%.3f s offload=%.3f s cpu_fallback=%.3f s rows=%d\n",
+            total_calls, total_us / 1e6, total_offload_us / 1e6, total_cpu_us / 1e6, n_rows);
+    fprintf(stderr,
+            "GGML_OP_PROFILE: op,calls,total_ms,total_pct,offload_calls,offload_ms,cpu_calls,cpu_ms\n");
+
+    for (int i = 0; i < n_rows; ++i) {
+        const int op = idxs[i];
+        const struct ggml_op_profile_entry * e = &g_ggml_op_profile.entries[op];
+        const double total_pct = total_us > 0 ? (100.0 * (double) e->total_us / (double) total_us) : 0.0;
+        fprintf(stderr,
+                "GGML_OP_PROFILE: %s,%" PRIu64 ",%.3f,%.2f,%" PRIu64 ",%.3f,%" PRIu64 ",%.3f\n",
+                ggml_op_name((enum ggml_op) op),
+                e->calls,
+                e->total_us / 1e3,
+                total_pct,
+                e->offload_calls,
+                e->offload_us / 1e3,
+                e->cpu_calls,
+                e->cpu_us / 1e3);
+    }
+
+    FILE * detail_fp = NULL;
+    if (g_ggml_op_profile.detail_csv_path[0] != '\0') {
+        detail_fp = ggml_fopen(g_ggml_op_profile.detail_csv_path, "w");
+        if (!detail_fp) {
+            fprintf(stderr, "GGML_OP_PROFILE: failed to open detail csv path '%s' (%s)\n",
+                    g_ggml_op_profile.detail_csv_path, strerror(errno));
+        } else {
+            fprintf(detail_fp,
+                    "op,device,calls,total_us,total_ms,avg_ms,total_pct,copy_bytes,contract_id,fallback_reason\n");
+        }
+    }
+
+    fprintf(stderr, "GGML_OP_PROFILE_DETAIL: op,device,calls,total_ms,avg_ms,total_pct,copy_bytes,contract_id,fallback_reason\n");
+    for (int i = 0; i < n_rows; ++i) {
+        const int op = idxs[i];
+        const struct ggml_op_profile_entry * e = &g_ggml_op_profile.entries[op];
+        char fallback_summary[256];
+        ggml_op_profile_fallback_summary(e, fallback_summary, sizeof(fallback_summary));
+
+        if (e->cpu_calls > 0) {
+            const double pct = total_us > 0 ? (100.0 * (double) e->cpu_us / (double) total_us) : 0.0;
+            fprintf(stderr, "GGML_OP_PROFILE_DETAIL: %s,CPU,%" PRIu64 ",%.3f,%.6f,%.6f,%" PRIu64 ",%s,%s\n",
+                    ggml_op_name((enum ggml_op) op),
+                    e->cpu_calls,
+                    e->cpu_us / 1e3,
+                    e->cpu_calls > 0 ? (double) e->cpu_us / (double) e->cpu_calls / 1e3 : 0.0,
+                    pct,
+                    e->cpu_copy_bytes,
+                    contract_id,
+                    fallback_summary[0] ? fallback_summary : "-");
+            if (detail_fp) {
+                fprintf(detail_fp, "%s,CPU,%" PRIu64 ",%" PRIu64 ",%.3f,%.6f,%.6f,%" PRIu64 ",%s,%s\n",
+                        ggml_op_name((enum ggml_op) op),
+                        e->cpu_calls,
+                        e->cpu_us,
+                        e->cpu_us / 1e3,
+                        e->cpu_calls > 0 ? (double) e->cpu_us / (double) e->cpu_calls / 1e3 : 0.0,
+                        pct,
+                        e->cpu_copy_bytes,
+                        contract_id,
+                        fallback_summary[0] ? fallback_summary : "-");
+            }
+        }
+
+        if (e->hmx_calls > 0) {
+            const double pct = total_us > 0 ? (100.0 * (double) e->hmx_us / (double) total_us) : 0.0;
+            fprintf(stderr, "GGML_OP_PROFILE_DETAIL: %s,HMX,%" PRIu64 ",%.3f,%.6f,%.6f,%" PRIu64 ",%s,-\n",
+                    ggml_op_name((enum ggml_op) op),
+                    e->hmx_calls,
+                    e->hmx_us / 1e3,
+                    e->hmx_calls > 0 ? (double) e->hmx_us / (double) e->hmx_calls / 1e3 : 0.0,
+                    pct,
+                    e->hmx_copy_bytes,
+                    contract_id);
+            if (detail_fp) {
+                fprintf(detail_fp, "%s,HMX,%" PRIu64 ",%" PRIu64 ",%.3f,%.6f,%.6f,%" PRIu64 ",%s,-\n",
+                        ggml_op_name((enum ggml_op) op),
+                        e->hmx_calls,
+                        e->hmx_us,
+                        e->hmx_us / 1e3,
+                        e->hmx_calls > 0 ? (double) e->hmx_us / (double) e->hmx_calls / 1e3 : 0.0,
+                        pct,
+                        e->hmx_copy_bytes,
+                        contract_id);
+            }
+        }
+
+        if (e->hvx_calls > 0) {
+            const double pct = total_us > 0 ? (100.0 * (double) e->hvx_us / (double) total_us) : 0.0;
+            fprintf(stderr, "GGML_OP_PROFILE_DETAIL: %s,HVX,%" PRIu64 ",%.3f,%.6f,%.6f,%" PRIu64 ",%s,-\n",
+                    ggml_op_name((enum ggml_op) op),
+                    e->hvx_calls,
+                    e->hvx_us / 1e3,
+                    e->hvx_calls > 0 ? (double) e->hvx_us / (double) e->hvx_calls / 1e3 : 0.0,
+                    pct,
+                    e->hvx_copy_bytes,
+                    contract_id);
+            if (detail_fp) {
+                fprintf(detail_fp, "%s,HVX,%" PRIu64 ",%" PRIu64 ",%.3f,%.6f,%.6f,%" PRIu64 ",%s,-\n",
+                        ggml_op_name((enum ggml_op) op),
+                        e->hvx_calls,
+                        e->hvx_us,
+                        e->hvx_us / 1e3,
+                        e->hvx_calls > 0 ? (double) e->hvx_us / (double) e->hvx_calls / 1e3 : 0.0,
+                        pct,
+                        e->hvx_copy_bytes,
+                        contract_id);
+            }
+        }
+
+        if (e->htp_calls > 0) {
+            const double pct = total_us > 0 ? (100.0 * (double) e->htp_us / (double) total_us) : 0.0;
+            fprintf(stderr, "GGML_OP_PROFILE_DETAIL: %s,HTP,%" PRIu64 ",%.3f,%.6f,%.6f,%" PRIu64 ",%s,-\n",
+                    ggml_op_name((enum ggml_op) op),
+                    e->htp_calls,
+                    e->htp_us / 1e3,
+                    e->htp_calls > 0 ? (double) e->htp_us / (double) e->htp_calls / 1e3 : 0.0,
+                    pct,
+                    e->htp_copy_bytes,
+                    contract_id);
+            if (detail_fp) {
+                fprintf(detail_fp, "%s,HTP,%" PRIu64 ",%" PRIu64 ",%.3f,%.6f,%.6f,%" PRIu64 ",%s,-\n",
+                        ggml_op_name((enum ggml_op) op),
+                        e->htp_calls,
+                        e->htp_us,
+                        e->htp_us / 1e3,
+                        e->htp_calls > 0 ? (double) e->htp_us / (double) e->htp_calls / 1e3 : 0.0,
+                        pct,
+                        e->htp_copy_bytes,
+                        contract_id);
+            }
+        }
+    }
+    if (detail_fp) {
+        fclose(detail_fp);
+        fprintf(stderr, "GGML_OP_PROFILE: wrote detail csv to %s\n", g_ggml_op_profile.detail_csv_path);
+    }
+
+    if (g_ggml_op_profile.csv_path[0] == '\0') {
+        goto maybe_shape_csv;
+    }
+
+    FILE * fp = ggml_fopen(g_ggml_op_profile.csv_path, "w");
+    if (!fp) {
+        fprintf(stderr, "GGML_OP_PROFILE: failed to open csv path '%s' (%s)\n",
+                g_ggml_op_profile.csv_path, strerror(errno));
+        return;
+    }
+
+    fprintf(fp, "op,calls,total_us,total_ms,total_pct,offload_calls,offload_us,offload_ms,cpu_calls,cpu_us,cpu_ms,offload_copy_bytes,cpu_copy_bytes,total_copy_bytes,contract_id,fallback_reason\n");
+    for (int i = 0; i < n_rows; ++i) {
+        const int op = idxs[i];
+        const struct ggml_op_profile_entry * e = &g_ggml_op_profile.entries[op];
+        const double total_pct = total_us > 0 ? (100.0 * (double) e->total_us / (double) total_us) : 0.0;
+        char fallback_summary[256];
+        ggml_op_profile_fallback_summary(e, fallback_summary, sizeof(fallback_summary));
+        fprintf(fp,
+                "%s,%" PRIu64 ",%" PRIu64 ",%.3f,%.6f,%" PRIu64 ",%" PRIu64 ",%.3f,%" PRIu64 ",%" PRIu64 ",%.3f,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%s,%s\n",
+                ggml_op_name((enum ggml_op) op),
+                e->calls,
+                e->total_us,
+                e->total_us / 1e3,
+                total_pct,
+                e->offload_calls,
+                e->offload_us,
+                e->offload_us / 1e3,
+                e->cpu_calls,
+                e->cpu_us,
+                e->cpu_us / 1e3,
+                e->offload_copy_bytes,
+                e->cpu_copy_bytes,
+                e->offload_copy_bytes + e->cpu_copy_bytes,
+                contract_id,
+                fallback_summary[0] ? fallback_summary : "-");
+    }
+
+    fclose(fp);
+    fprintf(stderr, "GGML_OP_PROFILE: wrote csv to %s\n", g_ggml_op_profile.csv_path);
+
+maybe_shape_csv:
+    if (g_ggml_op_profile.shape_csv_path[0] == '\0' || g_ggml_op_profile.n_shape_entries <= 0) {
+        return;
+    }
+
+    int sidx[GGML_OP_PROFILE_SHAPE_CAP];
+    for (int i = 0; i < g_ggml_op_profile.n_shape_entries; ++i) {
+        sidx[i] = i;
+    }
+    for (int i = 0; i < g_ggml_op_profile.n_shape_entries; ++i) {
+        for (int j = i + 1; j < g_ggml_op_profile.n_shape_entries; ++j) {
+            if (g_ggml_op_profile.shape_entries[sidx[j]].total_us >
+                g_ggml_op_profile.shape_entries[sidx[i]].total_us) {
+                SWAP(sidx[i], sidx[j], int);
+            }
+        }
+    }
+
+    FILE * sfp = ggml_fopen(g_ggml_op_profile.shape_csv_path, "w");
+    if (!sfp) {
+        fprintf(stderr, "GGML_OP_PROFILE: failed to open shape csv path '%s' (%s)\n",
+                g_ggml_op_profile.shape_csv_path, strerror(errno));
+        return;
+    }
+
+    fprintf(sfp, "op,shape,device,calls,total_us,total_ms,avg_ms,total_pct\n");
+    for (int i = 0; i < g_ggml_op_profile.n_shape_entries; ++i) {
+        const struct ggml_op_profile_shape_entry * e = &g_ggml_op_profile.shape_entries[sidx[i]];
+        const double total_pct = total_us > 0 ? (100.0 * (double) e->total_us / (double) total_us) : 0.0;
+        fprintf(sfp, "%s,%s,%s,%" PRIu64 ",%" PRIu64 ",%.3f,%.6f,%.6f\n",
+                ggml_op_name(e->op),
+                e->shape,
+                e->device,
+                e->calls,
+                e->total_us,
+                e->total_us / 1e3,
+                e->calls > 0 ? (double) e->total_us / (double) e->calls / 1e3 : 0.0,
+                total_pct);
+    }
+    fclose(sfp);
+    fprintf(stderr, "GGML_OP_PROFILE: wrote shape csv to %s\n", g_ggml_op_profile.shape_csv_path);
+}
+
+static bool ggml_op_profile_enabled(void) {
+    if (!g_ggml_op_profile.initialized) {
+        const char * env = getenv("GGML_OP_PROFILE");
+        g_ggml_op_profile.enabled =
+            env != NULL && env[0] != '\0' && strcmp(env, "0") != 0;
+
+        if (g_ggml_op_profile.enabled) {
+            const char * env_top = getenv("GGML_OP_PROFILE_TOP");
+            g_ggml_op_profile.top_n = env_top ? atoi(env_top) : 0;
+
+            const char * env_csv = getenv("GGML_OP_PROFILE_CSV");
+            if (env_csv && env_csv[0] != '\0') {
+                snprintf(g_ggml_op_profile.csv_path, sizeof(g_ggml_op_profile.csv_path), "%s", env_csv);
+            } else {
+                g_ggml_op_profile.csv_path[0] = '\0';
+            }
+
+            const char * env_detail_csv = getenv("GGML_OP_PROFILE_DETAIL_CSV");
+            if (env_detail_csv && env_detail_csv[0] != '\0') {
+                snprintf(g_ggml_op_profile.detail_csv_path, sizeof(g_ggml_op_profile.detail_csv_path), "%s", env_detail_csv);
+            } else if (g_ggml_op_profile.csv_path[0] != '\0') {
+                snprintf(g_ggml_op_profile.detail_csv_path, sizeof(g_ggml_op_profile.detail_csv_path),
+                         "%s_detail.csv", g_ggml_op_profile.csv_path);
+            } else {
+                g_ggml_op_profile.detail_csv_path[0] = '\0';
+            }
+
+            const char * env_shape_csv = getenv("GGML_OP_PROFILE_SHAPE_CSV");
+            if (env_shape_csv && env_shape_csv[0] != '\0') {
+                snprintf(g_ggml_op_profile.shape_csv_path, sizeof(g_ggml_op_profile.shape_csv_path), "%s", env_shape_csv);
+            } else if (g_ggml_op_profile.csv_path[0] != '\0') {
+                snprintf(g_ggml_op_profile.shape_csv_path, sizeof(g_ggml_op_profile.shape_csv_path),
+                         "%s_shape.csv", g_ggml_op_profile.csv_path);
+            } else {
+                g_ggml_op_profile.shape_csv_path[0] = '\0';
+            }
+
+            if (!g_ggml_op_profile.registered) {
+                atexit(ggml_op_profile_dump);
+                g_ggml_op_profile.registered = true;
+            }
+        }
+
+        g_ggml_op_profile.initialized = true;
+    }
+
+    return g_ggml_op_profile.enabled;
+}
+
+static inline void ggml_op_profile_record(const struct ggml_tensor * t, uint64_t us, bool offload,
+                                          uint64_t copy_bytes, const char * fallback_reason) {
+    if (!t) {
+        return;
+    }
+    const enum ggml_op op = t->op;
+    if (!g_ggml_op_profile.enabled) {
+        return;
+    }
+    if (op < 0 || op >= GGML_OP_COUNT) {
+        return;
+    }
+
+    struct ggml_op_profile_entry * e = &g_ggml_op_profile.entries[op];
+    e->calls += 1;
+    e->total_us += us;
+    if (offload) {
+        enum ggml_profile_device_kind kind = ggml_op_profile_device_kind(t, true);
+        e->offload_calls += 1;
+        e->offload_us += us;
+        e->offload_copy_bytes += copy_bytes;
+        switch (kind) {
+            case GGML_PROFILE_DEVICE_HMX:
+                e->hmx_calls += 1;
+                e->hmx_us += us;
+                e->hmx_copy_bytes += copy_bytes;
+                break;
+            case GGML_PROFILE_DEVICE_HVX:
+                e->hvx_calls += 1;
+                e->hvx_us += us;
+                e->hvx_copy_bytes += copy_bytes;
+                break;
+            case GGML_PROFILE_DEVICE_HTP:
+                e->htp_calls += 1;
+                e->htp_us += us;
+                e->htp_copy_bytes += copy_bytes;
+                break;
+            case GGML_PROFILE_DEVICE_CPU:
+            default:
+                break;
+        }
+    } else {
+        e->cpu_calls += 1;
+        e->cpu_us += us;
+        e->cpu_copy_bytes += copy_bytes;
+        ggml_op_profile_record_fallback_reason(e, fallback_reason);
+    }
+
+    ggml_op_profile_shape_record(t, us, offload);
+}
+
 static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
     GGML_ASSERT(params);
 
@@ -1686,6 +2490,31 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
     if (ggml_cpu_extra_compute_forward(params, tensor)) {
         return;
     }
+
+    const bool profile_enabled = (params->ith == 0) && ggml_op_profile_enabled();
+    int64_t profile_start_us = 0;
+    const char * profile_fallback_reason = NULL;
+    if (profile_enabled) {
+        profile_start_us = ggml_time_us();
+    }
+
+    // optional HTP offload hook (provided by ggml-htp backend when linked)
+#ifdef GGML_USE_HTP
+    if (ggml_htp_try_compute(params, tensor)) {
+        if (params->ith == 0) {
+            ggml_op_dump_record(tensor, true);
+        }
+        if (profile_enabled) {
+            const uint64_t profile_copy_bytes = ggml_htp_take_last_copy_bytes();
+            const int64_t dt = ggml_time_us() - profile_start_us;
+            ggml_op_profile_record(tensor, dt > 0 ? (uint64_t) dt : 0, true, profile_copy_bytes, NULL);
+        }
+        return;
+    }
+    if (profile_enabled) {
+        profile_fallback_reason = ggml_htp_take_last_fallback_reason();
+    }
+#endif
 
     switch (tensor->op) {
         case GGML_OP_DUP:
@@ -2083,6 +2912,15 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 GGML_ABORT("fatal error");
             }
+    }
+
+    if (params->ith == 0) {
+        ggml_op_dump_record(tensor, false);
+    }
+
+    if (profile_enabled) {
+        const int64_t dt = ggml_time_us() - profile_start_us;
+        ggml_op_profile_record(tensor, dt > 0 ? (uint64_t) dt : 0, false, 0, profile_fallback_reason);
     }
 }
 

@@ -257,6 +257,7 @@ set   (GGML_OPENCL_TARGET_VERSION "300" CACHE STRING
 
 option(GGML_HEXAGON                         "ggml: enable Hexagon backend"                    OFF)
 set(GGML_HEXAGON_FP32_QUANTIZE_GROUP_SIZE 128 CACHE STRING "ggml: quantize group size (32, 64, or 128)")
+option(GGML_HTP                             "ggml: enable HTP backend"                        OFF)
 
 # toolchain for vulkan-shaders-gen
 set   (GGML_VULKAN_SHADERS_GEN_TOOLCHAIN "" CACHE FILEPATH "ggml: toolchain file for vulkan-shaders-gen")
@@ -327,6 +328,7 @@ set(GGML_PUBLIC_HEADERS
     include/ggml-vulkan.h
     include/ggml-webgpu.h
     include/ggml-zendnn.h
+    include/ggml-htp.h
     include/gguf.h)
 
 set_target_properties(ggml PROPERTIES PUBLIC_HEADER "${GGML_PUBLIC_HEADERS}")

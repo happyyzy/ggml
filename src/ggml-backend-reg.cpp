@@ -62,6 +62,10 @@
 #include "ggml-hexagon.h"
 #endif
 
+#ifdef GGML_USE_HTP
+#include "ggml-htp.h"
+#endif
+
 #ifdef GGML_USE_BLAS
 #include "ggml-blas.h"
 #endif
@@ -144,6 +148,9 @@ struct ggml_backend_registry {
 #endif
 #ifdef GGML_USE_HEXAGON
         register_backend(ggml_backend_hexagon_reg());
+#endif
+#ifdef GGML_USE_HTP
+        register_backend(ggml_backend_htp_reg());
 #endif
 #ifdef GGML_USE_CANN
         register_backend(ggml_backend_cann_reg());
