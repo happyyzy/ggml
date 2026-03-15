@@ -18,6 +18,8 @@ bool ggml_backend_buft_is_rpcmem(ggml_backend_buffer_type_t buft);
 
 #define GGML_HTP_ZIMG_ROPE_INTERLEAVED_NAME "htp_zimg_rope_interleaved"
 #define GGML_HTP_ZIMG_ROPE_NEOX_NAME        "htp_zimg_rope_neox"
+#define GGML_HTP_ZIMG_QKNORM_ROPE_INTERLEAVED_NAME "htp_zimg_qknorm_rope_interleaved"
+#define GGML_HTP_ZIMG_QKNORM_ROPE_NEOX_NAME        "htp_zimg_qknorm_rope_neox"
 
 enum ggml_htp_zimg_rope_flags {
     GGML_HTP_ZIMG_ROPE_FLAG_INTERLEAVED = 1u << 0,

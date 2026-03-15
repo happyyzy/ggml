@@ -16,6 +16,7 @@ enum HtpOpsIndex {
   HTP_OPS_MAT_MUL_COMMON_W8D16A32,
   HTP_OPS_MAT_MUL_COMMON_W4D16A32_IQ4_NL,
   HTP_OPS_ZIMG_ROPE_F32,
+  HTP_OPS_ZIMG_QKNORM_ROPE_F32,
   HTP_OPS_COUNT,
 };
 
@@ -61,6 +62,17 @@ struct FlashAttnParams {
 struct ZimgRopeParams {
   struct RpcmemBufAddr output;
   struct RpcmemBufAddr input;
+  struct RpcmemBufAddr theta;
+  int32_t  d_head;
+  int32_t  seq_len;
+  int32_t  rows;
+  uint32_t flags;
+} __attribute__((packed));
+
+struct ZimgQkNormRopeParams {
+  struct RpcmemBufAddr output;
+  struct RpcmemBufAddr input;
+  struct RpcmemBufAddr weight;
   struct RpcmemBufAddr theta;
   int32_t  d_head;
   int32_t  seq_len;

@@ -188,8 +188,20 @@ static inline bool htp_is_zimg_rope_op(const ggml_tensor * dst) {
            std::strcmp(dst->name, GGML_HTP_ZIMG_ROPE_NEOX_NAME) == 0;
 }
 
+static inline bool htp_is_zimg_qknorm_rope_op(const ggml_tensor * dst) {
+    if (dst == nullptr || dst->op != GGML_OP_MAP_CUSTOM3) {
+        return false;
+    }
+    return std::strcmp(dst->name, GGML_HTP_ZIMG_QKNORM_ROPE_INTERLEAVED_NAME) == 0 ||
+           std::strcmp(dst->name, GGML_HTP_ZIMG_QKNORM_ROPE_NEOX_NAME) == 0;
+}
+
 static inline uint32_t htp_zimg_rope_flags(const ggml_tensor * dst) {
     return std::strcmp(dst->name, GGML_HTP_ZIMG_ROPE_INTERLEAVED_NAME) == 0 ? HTP_ZIMG_ROPE_FLAG_INTERLEAVED : 0u;
+}
+
+static inline uint32_t htp_zimg_qknorm_rope_flags(const ggml_tensor * dst) {
+    return std::strcmp(dst->name, GGML_HTP_ZIMG_QKNORM_ROPE_INTERLEAVED_NAME) == 0 ? HTP_ZIMG_ROPE_FLAG_INTERLEAVED : 0u;
 }
 
 static inline bool htp_zimg_rope_contract_ok(const ggml_tensor * dst) {
@@ -217,6 +229,50 @@ static inline bool htp_zimg_rope_contract_ok(const ggml_tensor * dst) {
     const bool contiguous_ok = ggml_is_contiguous(dst) && ggml_is_contiguous(src) && ggml_is_contiguous(theta);
     const bool aligned_ok = ptr_aligned(dst->data, kVecAlign) &&
                             ptr_aligned(src->data, kVecAlign) &&
+                            ptr_aligned(theta->data, kVecAlign);
+
+    return type_ok && shape_ok && contiguous_ok && aligned_ok;
+}
+
+static inline bool htp_zimg_qknorm_rope_contract_ok(const ggml_tensor * dst) {
+    if (!htp_is_zimg_qknorm_rope_op(dst)) {
+        return false;
+    }
+
+    const ggml_tensor * src    = dst->src[0];
+    const ggml_tensor * weight = dst->src[1];
+    const ggml_tensor * theta  = dst->src[2];
+    if (src == nullptr || weight == nullptr || theta == nullptr) {
+        return false;
+    }
+
+    constexpr size_t kVecAlign = 128;
+    auto ptr_aligned = [](const void * ptr, size_t align) {
+        return ptr != nullptr && (reinterpret_cast<uintptr_t>(ptr) % align) == 0;
+    };
+
+    const bool type_ok = dst->type == GGML_TYPE_F32 &&
+                         src->type == GGML_TYPE_F32 &&
+                         weight->type == GGML_TYPE_F32 &&
+                         theta->type == GGML_TYPE_F32;
+    const bool shape_ok = dst->ne[0] > 0 && (dst->ne[0] % 2) == 0 &&
+                          src->ne[0] == dst->ne[0] &&
+                          src->ne[1] == dst->ne[1] &&
+                          src->ne[2] == dst->ne[2] &&
+                          src->ne[3] == dst->ne[3] &&
+                          weight->ne[0] == dst->ne[0] &&
+                          weight->ne[1] == 1 &&
+                          weight->ne[2] * weight->ne[3] == dst->ne[2] * dst->ne[3] &&
+                          theta->ne[0] == 2 && theta->ne[1] == 2 &&
+                          theta->ne[2] * 2 == dst->ne[0] &&
+                          theta->ne[3] == dst->ne[1];
+    const bool contiguous_ok = ggml_is_contiguous(dst) &&
+                               ggml_is_contiguous(src) &&
+                               ggml_is_contiguous(weight) &&
+                               ggml_is_contiguous(theta);
+    const bool aligned_ok = ptr_aligned(dst->data, kVecAlign) &&
+                            ptr_aligned(src->data, kVecAlign) &&
+                            ptr_aligned(weight->data, kVecAlign) &&
                             ptr_aligned(theta->data, kVecAlign);
 
     return type_ok && shape_ok && contiguous_ok && aligned_ok;
@@ -3079,6 +3135,18 @@ bool htp_ops_support_op(const struct ggml_tensor * dst) {
                 }
                 return true;
             }
+        case GGML_OP_MAP_CUSTOM3:
+            {
+                if (!htp_is_zimg_qknorm_rope_op(dst)) {
+                    htp_fallback_record(HtpFallbackReason::kUnknownOp, dst);
+                    return false;
+                }
+                if (!htp_zimg_qknorm_rope_contract_ok(dst)) {
+                    htp_fallback_record(HtpFallbackReason::kUnknownOp, dst);
+                    return false;
+                }
+                return true;
+            }
         default:
             htp_fallback_record(HtpFallbackReason::kUnknownOp, dst);
             return false;
@@ -3402,6 +3470,35 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
 
                 op_index  = HTP_OPS_ZIMG_ROPE_F32;
                 args_size = sizeof(ZimgRopeParams);
+            }
+            break;
+        case GGML_OP_MAP_CUSTOM3:
+            {
+                GGML_ASSERT(htp_is_zimg_qknorm_rope_op(dst));
+                GGML_ASSERT(htp_zimg_qknorm_rope_contract_ok(dst));
+
+                auto mappings = get_all_rpcmem_mappings(dst);
+                GGML_ASSERT(mappings.size() == 4);
+
+                auto [out_fd, out_offset]       = mappings[0];
+                auto [src_fd, src_offset]       = mappings[1];
+                auto [weight_fd, weight_offset] = mappings[2];
+                auto [theta_fd, theta_offset]   = mappings[3];
+
+                ZimgQkNormRopeParams params{
+                    .output  = { out_fd,    (int32_t) out_offset    },
+                    .input   = { src_fd,    (int32_t) src_offset    },
+                    .weight  = { weight_fd, (int32_t) weight_offset },
+                    .theta   = { theta_fd,  (int32_t) theta_offset  },
+                    .d_head  = (int32_t) dst->ne[0],
+                    .seq_len = (int32_t) dst->ne[1],
+                    .rows    = (int32_t) (dst->ne[2] * dst->ne[3]),
+                    .flags   = htp_zimg_qknorm_rope_flags(dst),
+                };
+                *reinterpret_cast<ZimgQkNormRopeParams *>(param_buf) = params;
+
+                op_index  = HTP_OPS_ZIMG_QKNORM_ROPE_F32;
+                args_size = sizeof(ZimgQkNormRopeParams);
             }
             break;
 
