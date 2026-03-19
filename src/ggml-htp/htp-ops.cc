@@ -423,8 +423,9 @@ bool htp_runtime_repack_qweights_enabled() {
     static int enabled = -1;
     if (enabled < 0) {
         const char * env = std::getenv("GGML_HTP_RUNTIME_REPACK_QWEIGHTS");
-        // Enabled by default for plain GGUF tensors (non pre-permuted).
-        enabled = (!env || env[0] == '\0' || std::strcmp(env, "0") != 0) ? 1 : 0;
+        // fix1 diffusion GGUFs are already exported in the target prepacked layout.
+        // Keep runtime repack disabled by default; explicit opt-in remains available.
+        enabled = (env && env[0] != '\0' && std::strcmp(env, "0") != 0) ? 1 : 0;
     }
     return enabled != 0;
 }
@@ -442,6 +443,8 @@ bool htp_runtime_permute_qweights_enabled() {
     static int enabled = -1;
     if (enabled < 0) {
         const char * env = std::getenv("GGML_HTP_RUNTIME_PERMUTE_QWEIGHTS");
+        // fix1 diffusion GGUFs are already exported in the target permuted layout.
+        // Keep runtime permute disabled by default; explicit opt-in remains available.
         enabled = (env && env[0] != '\0' && std::strcmp(env, "0") != 0) ? 1 : 0;
     }
     return enabled != 0;
@@ -488,8 +491,8 @@ bool htp_cap_embed_matmul_enabled() {
     static int enabled = -1;
     if (enabled < 0) {
         const char * env = std::getenv("GGML_HTP_ENABLE_CAP_EMBED_MATMUL");
-        // Keep cap_embedder matmul on CPU by default until its contract is validated.
-        enabled = (env && env[0] != '\0' && std::strcmp(env, "0") != 0) ? 1 : 0;
+        // fix1 validated baseline routes cap_embedder.1 through HMX by default.
+        enabled = (!env || env[0] == '\0' || std::strcmp(env, "0") != 0) ? 1 : 0;
     }
     return enabled != 0;
 }
@@ -498,8 +501,8 @@ bool htp_noise_refiner_w2_matmul_enabled() {
     static int enabled = -1;
     if (enabled < 0) {
         const char * env = std::getenv("GGML_HTP_ENABLE_NOISE_REFINER_W2_MATMUL");
-        // Keep noise_refiner.{0,1}.feed_forward.w2 on CPU by default until contract is validated.
-        enabled = (env && env[0] != '\0' && std::strcmp(env, "0") != 0) ? 1 : 0;
+        // fix1 validated baseline routes noise_refiner.{0,1}.feed_forward.w2 through HMX by default.
+        enabled = (!env || env[0] == '\0' || std::strcmp(env, "0") != 0) ? 1 : 0;
     }
     return enabled != 0;
 }
