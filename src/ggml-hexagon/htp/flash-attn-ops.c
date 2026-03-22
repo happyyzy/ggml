@@ -149,6 +149,7 @@ static inline void hvx_mad_f32_f16_aa(float * restrict y, const void * restrict 
 }
 
 #define FLASH_ATTN_BLOCK_SIZE 128
+#define HTP_FLASH_ATTN_EXT_FLAG_SYNTH_ZERO_MASK (1u << 0)
 
 static void flash_attn_ext_f16_thread(struct htp_ops_context * octx, int ith, int nth) {
     const struct htp_tensor * q = &octx->src0;
@@ -157,6 +158,9 @@ static void flash_attn_ext_f16_thread(struct htp_ops_context * octx, int ith, in
     const struct htp_tensor * mask  = (octx->src3.data) ? &octx->src3 : NULL;
     const struct htp_tensor * sinks = (octx->src4.data) ? &octx->src4 : NULL;
     struct htp_tensor * dst = &octx->dst;
+    const uint32_t flash_flags = (uint32_t) octx->op_params[4];
+    const bool synth_zero_mask = (mask == NULL) && ((flash_flags & HTP_FLASH_ATTN_EXT_FLAG_SYNTH_ZERO_MASK) != 0);
+    const bool use_mask = mask || synth_zero_mask;
 
     const uint32_t neq0 = q->ne[0];
     const uint32_t neq1 = q->ne[1];
@@ -295,11 +299,15 @@ static void flash_attn_ext_f16_thread(struct htp_ops_context * octx, int ith, in
             dma_queue_push(dma, dma_make_ptr(v_dst, v_src), size_v_row_padded, nbv1, size_v_row, current_block_size);
 
             // Mask
-            if (mask) {
-                const uint8_t * m_src = (const uint8_t *) (mp_base + ic_start);
+            if (use_mask) {
                 uint8_t * m_dst = spad_m + (ib % 2) * size_m_block;
-                // Mask is 1D contiguous for this row
-                dma_queue_push(dma, dma_make_ptr(m_dst, m_src), current_block_size * 2, current_block_size * 2, current_block_size * 2, 1);
+                if (mask) {
+                    const uint8_t * m_src = (const uint8_t *) (mp_base + ic_start);
+                    // Mask is 1D contiguous for this row
+                    dma_queue_push(dma, dma_make_ptr(m_dst, m_src), current_block_size * 2, current_block_size * 2, current_block_size * 2, 1);
+                } else {
+                    memset(m_dst, 0, current_block_size * sizeof(__fp16));
+                }
             }
         }
 
@@ -312,7 +320,12 @@ static void flash_attn_ext_f16_thread(struct htp_ops_context * octx, int ith, in
             // Wait for DMA
             uint8_t * k_base = dma_queue_pop(dma).dst; // K
             uint8_t * v_base = dma_queue_pop(dma).dst; // V
-            __fp16  * m_base = mask ? dma_queue_pop(dma).dst : NULL; // M
+            __fp16  * m_base = NULL;
+            if (mask) {
+                m_base = dma_queue_pop(dma).dst; // M
+            } else if (synth_zero_mask) {
+                m_base = (__fp16 *) (spad_m + (ib % 2) * size_m_block);
+            }
 
             // Inner loop processing the block from VTCM
             uint32_t ic = 0;
@@ -344,7 +357,7 @@ static void flash_attn_ext_f16_thread(struct htp_ops_context * octx, int ith, in
                 }
 
                 // 3. Mask
-                if (mask) {
+                if (use_mask) {
                     const __fp16 * mp = m_base + ic;
                     HVX_Vector m_vals_f16 = *(const HVX_UVector *) mp;
 
@@ -413,7 +426,7 @@ static void flash_attn_ext_f16_thread(struct htp_ops_context * octx, int ith, in
                     s_val = logit_softcap * tanhf(s_val);
                 }
 
-                if (mask) {
+                if (use_mask) {
                     const float m_val = m_base[ic];
                     s_val += slope * m_val;
                 }
@@ -452,9 +465,13 @@ static void flash_attn_ext_f16_thread(struct htp_ops_context * octx, int ith, in
                 dma_queue_push(dma, dma_make_ptr(v_base, v_src), size_v_row_padded, nbv1, size_v_row, next_block_size);
 
                 // Mask
-                if (mask) {
-                    const uint8_t * m_src = (const uint8_t *) (mp_base + next_ic_start);
-                    dma_queue_push(dma, dma_make_ptr(m_base, m_src), next_block_size * 2, next_block_size * 2, next_block_size * 2, 1);
+                if (use_mask) {
+                    if (mask) {
+                        const uint8_t * m_src = (const uint8_t *) (mp_base + next_ic_start);
+                        dma_queue_push(dma, dma_make_ptr(m_base, m_src), next_block_size * 2, next_block_size * 2, next_block_size * 2, 1);
+                    } else {
+                        memset(m_base, 0, next_block_size * sizeof(__fp16));
+                    }
                 }
             }
         }
@@ -506,6 +523,7 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
     const struct htp_tensor * k = &octx->src1;
     const struct htp_tensor * v = &octx->src2;
     const struct htp_tensor * mask = (octx->src3.type != HTP_TYPE_COUNT) ? &octx->src3 : NULL;
+    const bool synth_zero_mask = (mask == NULL) && (((uint32_t) octx->op_params[4] & HTP_FLASH_ATTN_EXT_FLAG_SYNTH_ZERO_MASK) != 0);
     struct htp_tensor * dst = &octx->dst;
 
     // Check support
@@ -542,7 +560,7 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
     octx->src0_spad.size_per_thread = size_q_block * 1;
     octx->src1_spad.size_per_thread = size_k_block * 2;
     octx->src2_spad.size_per_thread = size_v_block * 2;
-    octx->src3_spad.size_per_thread = mask ? size_m_block * 2 : 0;
+    octx->src3_spad.size_per_thread = (mask || synth_zero_mask) ? size_m_block * 2 : 0;
     octx->dst_spad.size_per_thread  = size_vkq_acc;
 
     octx->src0_spad.size = octx->src0_spad.size_per_thread * octx->n_threads;

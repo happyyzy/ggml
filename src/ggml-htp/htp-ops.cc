@@ -536,6 +536,15 @@ bool htp_flash_force_null_mask_enabled() {
     return enabled != 0;
 }
 
+bool htp_flash_prepare_in_kernel_enabled() {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char * env = std::getenv("GGML_HTP_FLASH_PREP_IN_KERNEL");
+        enabled = (env && env[0] != '\0' && std::strcmp(env, "0") != 0) ? 1 : 0;
+    }
+    return enabled != 0;
+}
+
 bool htp_flash_swap_qo_kv_enabled() {
     static int enabled = -1;
     if (enabled < 0) {
@@ -3523,6 +3532,11 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                 flash_scale = *reinterpret_cast<const float *>(&dst->op_params[0]);
                 flash_max_bias = *reinterpret_cast<const float *>(&dst->op_params[1]);
                 flash_logit_softcap = *reinterpret_cast<const float *>(&dst->op_params[2]);
+                float flash_kv_scale = *reinterpret_cast<const float *>(&dst->op_params[5]);
+                if (!(flash_kv_scale > 0.0f)) {
+                    flash_kv_scale = 1.0f;
+                }
+                const bool flash_prepare_in_kernel = htp_flash_prepare_in_kernel_enabled() && graph_mask == nullptr;
                 const bool force_null_mask = htp_flash_force_null_mask_enabled();
                 if (force_null_mask) {
                     mask = nullptr;
@@ -3553,7 +3567,7 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                     auto mask_mapping = mappings[4];
                     mask_fd     = mask_mapping.first;
                     mask_offset = (int32_t) mask_mapping.second;
-                } else {
+                } else if (!flash_prepare_in_kernel) {
                     auto synthetic = get_or_create_synthetic_flash_mask(qo_len, kv_len);
                     if (synthetic.fd < 0) {
                         if (htp_debug_enabled()) {
@@ -3579,6 +3593,7 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                     .n_kv_heads = n_kv_heads,
                     .head_dim   = head_dim,
                     .scale      = flash_scale,
+                    .kv_scale   = flash_prepare_in_kernel ? flash_kv_scale : 1.0f,
                 };
                 *reinterpret_cast<FlashAttnParams *>(param_buf) = params;
 
