@@ -507,6 +507,17 @@ bool htp_noise_refiner_w2_matmul_enabled() {
     return enabled != 0;
 }
 
+bool htp_q8_out_stationary_enabled() {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char * env = std::getenv("GGML_HTP_Q8_OUTSTATIONARY");
+        // Align with llama.cpp-npu default behavior and allow host-side A/B by
+        // toggling a single runtime env on the same binaries.
+        enabled = (!env || env[0] == '\0' || std::strcmp(env, "0") != 0) ? 1 : 0;
+    }
+    return enabled != 0;
+}
+
 bool htp_flash_attn_enabled() {
     static int enabled = -1;
     if (enabled < 0) {
@@ -780,6 +791,40 @@ const char * htp_matmul_debug_dump_dir() {
     return "/data/local/tmp";
 }
 
+bool htp_matmul_debug_raw_dump_only_selected(uint64_t call_idx) {
+    const int  raw_dump_call = htp_env_int_cached("GGML_HTP_DEBUG_MATMUL_RAW_DUMP_CALL", 0);
+    const bool raw_dump_only = htp_env_int_cached("GGML_HTP_DEBUG_MATMUL_RAW_DUMP_ONLY", 0) != 0;
+    return raw_dump_only && raw_dump_call > 0 && (int) call_idx == raw_dump_call;
+}
+
+bool htp_q8_outstationary_firstblock_dump_enabled() {
+    return htp_env_int_cached("GGML_HTP_Q8_OUTSTATIONARY_FIRSTBLOCK_DUMP", 0) != 0;
+}
+
+bool htp_q8_outstationary_firstblock_dump_selected(uint64_t call_idx) {
+    if (!htp_q8_outstationary_firstblock_dump_enabled()) {
+        return false;
+    }
+    const int raw_dump_call = htp_env_int_cached("GGML_HTP_DEBUG_MATMUL_RAW_DUMP_CALL", 0);
+    return raw_dump_call > 0 && (int) call_idx == raw_dump_call;
+}
+
+bool htp_q8_outstationary_acttile_dump_enabled() {
+    return htp_env_int_cached("GGML_HTP_Q8_OUTSTATIONARY_ACTTILE_DUMP", 0) != 0;
+}
+
+bool htp_q8_outstationary_act_direct_stage_enabled() {
+    return htp_env_int_cached("GGML_HTP_Q8_OUTSTATIONARY_ACT_DIRECT_STAGE", 0) != 0;
+}
+
+bool htp_q8_outstationary_act_scratch_direct_transfer_enabled() {
+    return htp_env_int_cached("GGML_HTP_Q8_OUTSTATIONARY_ACT_SCRATCH_DIRECT_TRANSFER", 0) != 0;
+}
+
+bool htp_q8_outstationary_scratch_scalardump_enabled() {
+    return htp_env_int_cached("GGML_HTP_Q8_OUTSTATIONARY_SCRATCH_SCALARDUMP", 0) != 0;
+}
+
 bool htp_dump_raw_f32_to_file(const std::string & path, const char * name, const float * data,
                               int32_t ne0, int32_t ne1) {
     if (data == nullptr || ne0 <= 0 || ne1 <= 0) {
@@ -836,6 +881,35 @@ bool htp_dump_tensor_to_file(const std::string & path, const char * name, const 
     }
     const size_t nbytes = ggml_nbytes(tensor);
     std::fwrite(tensor->data, 1, nbytes, f);
+    std::fflush(f);
+    std::fclose(f);
+    return true;
+}
+
+bool htp_dump_raw_bytes_tensor_to_file(const std::string & path, const char * name, ggml_type type,
+                                       const void * data, size_t nbytes, int32_t ne0, int32_t ne1) {
+    if (data == nullptr || nbytes == 0 || ne0 <= 0 || ne1 <= 0) {
+        return false;
+    }
+
+    FILE * f = std::fopen(path.c_str(), "wb");
+    if (f == nullptr) {
+        return false;
+    }
+
+    const int32_t n_dims   = 2;
+    const int32_t name_len = name ? static_cast<int32_t>(std::strlen(name)) : 0;
+    const int32_t ttype    = static_cast<int32_t>(type);
+    const int32_t dims[2]  = { ne0, ne1 };
+
+    std::fwrite(&n_dims, sizeof(n_dims), 1, f);
+    std::fwrite(&name_len, sizeof(name_len), 1, f);
+    std::fwrite(&ttype, sizeof(ttype), 1, f);
+    std::fwrite(dims, sizeof(int32_t), 2, f);
+    if (name_len > 0) {
+        std::fwrite(name, 1, name_len, f);
+    }
+    std::fwrite(data, 1, nbytes, f);
     std::fflush(f);
     std::fclose(f);
     return true;
@@ -1022,7 +1096,8 @@ bool htp_skip_qkv_permute_repack(const ggml_tensor * weight) {
     if (!enabled) {
         return false;
     }
-    const bool skip_w2 = htp_env_int_cached("GGML_HTP_SKIP_W2_PERMUTE_REPACK", 1) != 0;
+    // Task-2 mainline requires W2 q8 out_stationary to stay on the permuted route.
+    const bool skip_w2 = htp_env_int_cached("GGML_HTP_SKIP_W2_PERMUTE_REPACK", 0) != 0;
     // For DiT qkv-family in q4/q8 path, runtime float-permute+requant introduces measurable drift.
     // Keep these weights in original quant layout and let DSP side use common dequantization path.
     return std::strstr(name, ".attention.qkv.weight") != nullptr ||
@@ -2066,6 +2141,52 @@ void htp_debug_compare_matmul_snapshot(const MatmulDebugSnapshot & snap) {
 
     const auto * activation = reinterpret_cast<const float *>(snap.activation->data);
     const auto * output     = reinterpret_cast<const float *>(snap.dst->data);
+
+    const int  raw_dump_call = htp_env_int_cached("GGML_HTP_DEBUG_MATMUL_RAW_DUMP_CALL", 0);
+    const bool raw_dump_only = htp_env_int_cached("GGML_HTP_DEBUG_MATMUL_RAW_DUMP_ONLY", 0) != 0;
+    if (raw_dump_call > 0 && (int) snap.call_idx == raw_dump_call) {
+        const std::string base = std::string(htp_matmul_debug_dump_dir()) + "/htp_mmdebug_call_" +
+                                 std::to_string(snap.call_idx);
+        const bool act_raw_ok = htp_dump_raw_f32_to_file(base + "_act_raw.tensor", "activation_raw", activation, k, m);
+        const bool out_raw_ok = htp_dump_raw_f32_to_file(base + "_out_raw.tensor", "output_raw", output, n, m);
+        const bool weight_raw_ok =
+            htp_dump_raw_bytes_tensor_to_file(base + "_weight_raw.tensor",
+                                              snap.weight_name.empty() ? "weight_raw" : snap.weight_name.c_str(),
+                                              snap.weight_type,
+                                              snap.weight_raw.data(),
+                                              snap.weight_raw.size(),
+                                              k,
+                                              n);
+
+        FILE * meta = std::fopen((base + "_raw_meta.txt").c_str(), "wb");
+        if (meta != nullptr) {
+            std::fprintf(meta, "call=%llu\n",
+                         (unsigned long long) snap.call_idx);
+            std::fprintf(meta, "weight_name=%s\n",
+                         snap.weight_name.empty() ? "<unnamed>" : snap.weight_name.c_str());
+            std::fprintf(meta, "wtype=%s m=%d k=%d n=%d\n",
+                         ggml_type_name(snap.weight_type), m, k, n);
+            std::fprintf(meta, "dump_ok_act_raw=%d dump_ok_out_raw=%d dump_ok_weight_raw=%d\n",
+                         act_raw_ok ? 1 : 0, out_raw_ok ? 1 : 0, weight_raw_ok ? 1 : 0);
+            std::fclose(meta);
+        }
+
+        if (raw_dump_only) {
+            std::fprintf(stderr,
+                         "HTP_MATMUL_DEBUG raw_dump_only call=%llu wtype=%s m=%d k=%d n=%d w_name=%s "
+                         "dump_ok_act_raw=%d dump_ok_out_raw=%d dump_ok_weight_raw=%d\n",
+                         (unsigned long long) snap.call_idx,
+                         ggml_type_name(snap.weight_type),
+                         m,
+                         k,
+                         n,
+                         snap.weight_name.empty() ? "<unnamed>" : snap.weight_name.c_str(),
+                         act_raw_ok ? 1 : 0,
+                         out_raw_ok ? 1 : 0,
+                         weight_raw_ok ? 1 : 0);
+            return;
+        }
+    }
 
     std::vector<float> activation_f16((size_t) m * k, 0.0f);
     {
@@ -3287,7 +3408,35 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                     .m          = m,
                     .k          = k,
                     .n          = n,
+                    .flags      = htp_q8_out_stationary_enabled() ? HTP_MATMUL_FLAG_Q8_OUT_STATIONARY : 0u,
                 };
+                if (weight->type == GGML_TYPE_Q8_0 &&
+                    htp_q8_out_stationary_enabled() &&
+                    mm_debug.armed &&
+                    htp_q8_outstationary_firstblock_dump_selected(mm_debug.call_idx)) {
+                    mm_params.flags |= HTP_MATMUL_FLAG_DBG_OUTSTAT_FIRSTBLOCK_DUMP;
+                }
+                if (weight->type == GGML_TYPE_Q8_0 &&
+                    htp_q8_out_stationary_enabled() &&
+                    mm_debug.armed &&
+                    htp_q8_outstationary_acttile_dump_enabled() &&
+                    htp_matmul_debug_raw_dump_only_selected(mm_debug.call_idx)) {
+                    mm_params.flags |= HTP_MATMUL_FLAG_DBG_OUTSTAT_ACT_TILE_DUMP;
+                    if (htp_q8_outstationary_act_direct_stage_enabled()) {
+                        mm_params.flags |= HTP_MATMUL_FLAG_DBG_ACT_DIRECT_STAGE;
+                    }
+                    if (htp_q8_outstationary_act_scratch_direct_transfer_enabled()) {
+                        mm_params.flags |= HTP_MATMUL_FLAG_DBG_ACT_SCRATCH_DIRECT_TRANSFER;
+                    }
+                }
+                if (weight->type == GGML_TYPE_Q8_0 &&
+                    htp_q8_out_stationary_enabled() &&
+                    mm_debug.armed &&
+                    htp_q8_outstationary_scratch_scalardump_enabled() &&
+                    htp_matmul_debug_raw_dump_only_selected(mm_debug.call_idx)) {
+                    mm_params.flags |= HTP_MATMUL_FLAG_DBG_OUTSTAT_SCRATCH_HVX_DUMP;
+                    mm_params.flags |= HTP_MATMUL_FLAG_DBG_ACT_META_OUT;
+                }
                 *reinterpret_cast<MatMulParams *>(param_buf) = mm_params;
                 matmul_params = mm_params;
                 matmul_params_ready = true;
@@ -3569,6 +3718,13 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
         auto & mm_debug = htp_matmul_debug_snapshot();
         if (htp_matmul_debug_check_enabled() && mm_debug.armed && !mm_debug.done) {
             htp_debug_compare_matmul_snapshot(mm_debug);
+            if (htp_matmul_debug_raw_dump_only_selected(mm_debug.call_idx)) {
+                std::fprintf(stderr,
+                             "HTP_MATMUL_DEBUG raw dump emitted for call=%llu, exiting before graph continues\n",
+                             (unsigned long long) mm_debug.call_idx);
+                std::fflush(stderr);
+                std::exit(0);
+            }
             mm_debug.done = !htp_matmul_debug_check_all_enabled();
             mm_debug.armed = false;
             mm_debug.weight_name.clear();

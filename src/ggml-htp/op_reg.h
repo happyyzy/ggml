@@ -24,6 +24,16 @@ enum HtpZimgRopeFlags {
   HTP_ZIMG_ROPE_FLAG_INTERLEAVED = 1u << 0,
 };
 
+enum HtpMatMulFlags {
+  HTP_MATMUL_FLAG_Q8_OUT_STATIONARY = 1u << 0,
+  HTP_MATMUL_FLAG_DBG_OUTSTAT_ACT_TILE_DUMP = 1u << 1,
+  HTP_MATMUL_FLAG_DBG_ACT_DIRECT_STAGE = 1u << 2,
+  HTP_MATMUL_FLAG_DBG_ACT_SCRATCH_DIRECT_TRANSFER = 1u << 3,
+  HTP_MATMUL_FLAG_DBG_OUTSTAT_SCRATCH_HVX_DUMP = 1u << 4,
+  HTP_MATMUL_FLAG_DBG_ACT_META_OUT = 1u << 22,
+  HTP_MATMUL_FLAG_DBG_OUTSTAT_FIRSTBLOCK_DUMP = 1u << 31,
+};
+
 struct RpcmemBufAddr {
   int32_t fd;
   int32_t offset;
@@ -43,6 +53,7 @@ struct MatMulParams {
   int32_t m;
   int32_t k;
   int32_t n;
+  uint32_t flags;
 } __attribute__((packed));
 
 struct FlashAttnParams {
