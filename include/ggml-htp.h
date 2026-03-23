@@ -25,6 +25,11 @@ enum ggml_htp_zimg_rope_flags {
     GGML_HTP_ZIMG_ROPE_FLAG_INTERLEAVED = 1u << 0,
 };
 
+enum ggml_htp_flash_attn_flags {
+    GGML_HTP_FLASH_ATTN_FLAG_Q_ROW_MAJOR = 1u << 8,
+    GGML_HTP_FLASH_ATTN_FLAG_K_ROW_MAJOR = 1u << 9,
+};
+
 typedef struct ggml_htp_runtime_options {
     bool enable_stats;
     bool enable_fallback_stats;

@@ -250,6 +250,9 @@ static inline bool htp_zimg_qknorm_rope_contract_ok(const ggml_tensor * dst) {
     auto ptr_aligned = [](const void * ptr, size_t align) {
         return ptr != nullptr && (reinterpret_cast<uintptr_t>(ptr) % align) == 0;
     };
+    auto stride_mul_float = [](size_t stride) {
+        return (stride % sizeof(float)) == 0;
+    };
 
     const bool type_ok = dst->type == GGML_TYPE_F32 &&
                          src->type == GGML_TYPE_F32 &&
@@ -266,8 +269,15 @@ static inline bool htp_zimg_qknorm_rope_contract_ok(const ggml_tensor * dst) {
                           theta->ne[0] == 2 && theta->ne[1] == 2 &&
                           theta->ne[2] * 2 == dst->ne[0] &&
                           theta->ne[3] == dst->ne[1];
+    const bool src_layout_ok = src->nb[0] == sizeof(float) &&
+                               stride_mul_float(src->nb[1]) &&
+                               stride_mul_float(src->nb[2]) &&
+                               stride_mul_float(src->nb[3]) &&
+                               src->nb[1] >= src->nb[0] * src->ne[0] &&
+                               src->nb[2] >= src->nb[0] * src->ne[0] &&
+                               src->nb[3] >= src->nb[2] * src->ne[2];
     const bool contiguous_ok = ggml_is_contiguous(dst) &&
-                               ggml_is_contiguous(src) &&
+                               src_layout_ok &&
                                ggml_is_contiguous(weight) &&
                                ggml_is_contiguous(theta);
     const bool aligned_ok = ptr_aligned(dst->data, kVecAlign) &&
@@ -780,12 +790,33 @@ int htp_flash_dump_max() {
     return htp_env_int_cached("GGML_HTP_FLASH_DUMP_MAX", 0);
 }
 
+bool htp_flash_hash_trace_enabled() {
+    return htp_env_int_cached("GGML_HTP_FLASH_HASH_TRACE", 0) != 0;
+}
+
 const char * htp_flash_dump_dir() {
     const char * env = std::getenv("GGML_HTP_FLASH_DUMP_DIR");
     if (env && env[0] != '\0') {
         return env;
     }
     return "/data/local/tmp";
+}
+
+static uint64_t htp_fnv1a64(const void * data, size_t len) {
+    const uint8_t * p = reinterpret_cast<const uint8_t *>(data);
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < len; ++i) {
+        h ^= static_cast<uint64_t>(p[i]);
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+static uint64_t htp_tensor_hash64(const ggml_tensor * t) {
+    if (t == nullptr || t->data == nullptr) {
+        return 0ull;
+    }
+    return htp_fnv1a64(t->data, ggml_nbytes(t));
 }
 
 int htp_matmul_debug_dump_call() {
@@ -3137,6 +3168,9 @@ bool htp_ops_support_op(const struct ggml_tensor * dst) {
                 auto * k    = dst->src[1];
                 auto * v    = dst->src[2];
                 auto * mask = dst->src[3];
+                const uint32_t flash_flags = *reinterpret_cast<const uint32_t *>(&dst->op_params[4]);
+                const bool flash_q_row_major = (flash_flags & GGML_HTP_FLASH_ATTN_FLAG_Q_ROW_MAJOR) != 0;
+                const bool flash_k_row_major = (flash_flags & GGML_HTP_FLASH_ATTN_FLAG_K_ROW_MAJOR) != 0;
 
                 // HTP flash-attn kernel does not receive tensor strides; it assumes a token-major physical
                 // layout for Q/K/V. For ggml tensors with ne=[D, L, H, N], this corresponds to:
@@ -3175,10 +3209,40 @@ bool htp_ops_support_op(const struct ggml_tensor * dst) {
                     }
                     return true;
                 };
+                auto flash_qk_rowmajor_layout_ok = [](const ggml_tensor * t) -> bool {
+                    if (!t) {
+                        return false;
+                    }
+                    const size_t elem = ggml_type_size(t->type);
+                    const size_t D    = (size_t) t->ne[0];
+                    const size_t L    = (size_t) t->ne[1];
+                    const size_t H    = (size_t) t->ne[2];
+                    if (D == 0 || L == 0 || H == 0) {
+                        return false;
+                    }
+                    if ((size_t) t->nb[0] != elem) {
+                        return false;
+                    }
+                    if ((size_t) t->nb[1] != D * elem) {
+                        return false;
+                    }
+                    if ((size_t) t->nb[2] != D * L * elem) {
+                        return false;
+                    }
+                    if (t->ne[3] > 1) {
+                        const size_t expect_nb3 = D * L * H * elem;
+                        if ((size_t) t->nb[3] != expect_nb3) {
+                            return false;
+                        }
+                    }
+                    return true;
+                };
 
                 constexpr size_t kVecAlign = 128;
                 bool contiguous_ok = ggml_is_contiguous(dst) &&
-                                     flash_io_layout_ok(q) && flash_io_layout_ok(k) && flash_io_layout_ok(v) &&
+                                     (flash_q_row_major ? flash_qk_rowmajor_layout_ok(q) : flash_io_layout_ok(q)) &&
+                                     (flash_k_row_major ? flash_qk_rowmajor_layout_ok(k) : flash_io_layout_ok(k)) &&
+                                     flash_io_layout_ok(v) &&
                                      (mask == nullptr || ggml_is_contiguous(mask));
                 bool aligned_ok = htp_ptr_aligned(dst->data, kVecAlign) && htp_ptr_aligned(q->data, kVecAlign) &&
                                   htp_ptr_aligned(k->data, kVecAlign) && htp_ptr_aligned(v->data, kVecAlign) &&
@@ -3311,6 +3375,8 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
     bool act_override_active = false;
     bool flash_dump_armed = false;
     int flash_dump_idx = -1;
+    bool flash_hash_trace_armed = false;
+    int flash_hash_trace_idx = -1;
     const ggml_tensor * flash_q = nullptr;
     const ggml_tensor * flash_k = nullptr;
     const ggml_tensor * flash_v = nullptr;
@@ -3532,6 +3598,7 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                 flash_scale = *reinterpret_cast<const float *>(&dst->op_params[0]);
                 flash_max_bias = *reinterpret_cast<const float *>(&dst->op_params[1]);
                 flash_logit_softcap = *reinterpret_cast<const float *>(&dst->op_params[2]);
+                const uint32_t flash_flags = *reinterpret_cast<const uint32_t *>(&dst->op_params[4]);
                 float flash_kv_scale = *reinterpret_cast<const float *>(&dst->op_params[5]);
                 if (!(flash_kv_scale > 0.0f)) {
                     flash_kv_scale = 1.0f;
@@ -3594,6 +3661,7 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                     .head_dim   = head_dim,
                     .scale      = flash_scale,
                     .kv_scale   = flash_prepare_in_kernel ? flash_kv_scale : 1.0f,
+                    .flags      = flash_flags,
                 };
                 *reinterpret_cast<FlashAttnParams *>(param_buf) = params;
 
@@ -3608,6 +3676,11 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                         flash_dump_armed = true;
                         flash_dump_idx = idx;
                     }
+                }
+                if (htp_flash_hash_trace_enabled()) {
+                    static std::atomic<int> trace_counter{ 0 };
+                    flash_hash_trace_armed = true;
+                    flash_hash_trace_idx = trace_counter.fetch_add(1, std::memory_order_relaxed) + 1;
                 }
             }
             break;
@@ -3643,6 +3716,7 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
             {
                 GGML_ASSERT(htp_is_zimg_qknorm_rope_op(dst));
                 GGML_ASSERT(htp_zimg_qknorm_rope_contract_ok(dst));
+                auto * src    = dst->src[0];
 
                 auto mappings = get_all_rpcmem_mappings(dst);
                 GGML_ASSERT(mappings.size() == 4);
@@ -3651,16 +3725,23 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                 auto [src_fd, src_offset]       = mappings[1];
                 auto [weight_fd, weight_offset] = mappings[2];
                 auto [theta_fd, theta_offset]   = mappings[3];
+                const auto src_nb1 = static_cast<int32_t>(src->nb[1] / sizeof(float));
+                const auto src_nb2 = static_cast<int32_t>(src->nb[2] / sizeof(float));
+                const auto src_nb3 = static_cast<int32_t>(src->nb[3] / sizeof(float));
 
                 ZimgQkNormRopeParams params{
-                    .output  = { out_fd,    (int32_t) out_offset    },
-                    .input   = { src_fd,    (int32_t) src_offset    },
-                    .weight  = { weight_fd, (int32_t) weight_offset },
-                    .theta   = { theta_fd,  (int32_t) theta_offset  },
-                    .d_head  = (int32_t) dst->ne[0],
-                    .seq_len = (int32_t) dst->ne[1],
-                    .rows    = (int32_t) (dst->ne[2] * dst->ne[3]),
-                    .flags   = htp_zimg_qknorm_rope_flags(dst),
+                    .output         = { out_fd,    (int32_t) out_offset    },
+                    .input          = { src_fd,    (int32_t) src_offset    },
+                    .weight         = { weight_fd, (int32_t) weight_offset },
+                    .theta          = { theta_fd,  (int32_t) theta_offset  },
+                    .d_head         = (int32_t) dst->ne[0],
+                    .seq_len        = (int32_t) dst->ne[1],
+                    .rows           = (int32_t) (dst->ne[2] * dst->ne[3]),
+                    .rows_per_batch = (int32_t) dst->ne[2],
+                    .src_nb1        = src_nb1,
+                    .src_nb2        = src_nb2,
+                    .src_nb3        = src_nb3,
+                    .flags          = htp_zimg_qknorm_rope_flags(dst),
                 };
                 *reinterpret_cast<ZimgQkNormRopeParams *>(param_buf) = params;
 
@@ -3750,6 +3831,21 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
     if (state == 0 && flash_dump_armed && flash_q != nullptr && flash_k != nullptr && flash_v != nullptr) {
         htp_flash_dump_tensors(flash_dump_idx, flash_q, flash_k, flash_v, flash_mask, dst,
                                flash_scale, flash_max_bias, flash_logit_softcap);
+    }
+
+    if (state == 0 && flash_hash_trace_armed && flash_q != nullptr && flash_k != nullptr && flash_v != nullptr) {
+        std::fprintf(stderr,
+                     "HTP_FLASH_HASH idx=%d qo=%ld kv=%ld heads=%ld kv_heads=%ld dim=%ld q=%016llx k=%016llx "
+                     "v=%016llx mask=%016llx o=%016llx scale=%g kv_scale=%g\n",
+                     flash_hash_trace_idx,
+                     flash_q->ne[1], flash_k->ne[1], flash_q->ne[2], flash_k->ne[2], flash_q->ne[0],
+                     (unsigned long long) htp_tensor_hash64(flash_q),
+                     (unsigned long long) htp_tensor_hash64(flash_k),
+                     (unsigned long long) htp_tensor_hash64(flash_v),
+                     (unsigned long long) htp_tensor_hash64(flash_mask),
+                     (unsigned long long) htp_tensor_hash64(dst),
+                     flash_scale,
+                     *reinterpret_cast<const float *>(&dst->op_params[5]));
     }
 
     if (act_override_active) {

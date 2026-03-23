@@ -69,6 +69,7 @@ struct FlashAttnParams {
   int32_t head_dim;
   float   scale;
   float   kv_scale;
+  uint32_t flags;
 } __attribute__((packed));
 
 struct ZimgRopeParams {
@@ -89,5 +90,9 @@ struct ZimgQkNormRopeParams {
   int32_t  d_head;
   int32_t  seq_len;
   int32_t  rows;
+  int32_t  rows_per_batch;
+  int32_t  src_nb1;
+  int32_t  src_nb2;
+  int32_t  src_nb3;
   uint32_t flags;
 } __attribute__((packed));
