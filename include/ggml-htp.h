@@ -25,6 +25,24 @@ enum ggml_htp_zimg_rope_flags {
     GGML_HTP_ZIMG_ROPE_FLAG_INTERLEAVED = 1u << 0,
 };
 
+enum ggml_htp_zimg_qknorm_rope_userdata_layout {
+    GGML_HTP_ZIMG_QKNORM_ROPE_USERDATA_FLAG_BITS = 16,
+    GGML_HTP_ZIMG_QKNORM_ROPE_USERDATA_FLAG_MASK = (1u << GGML_HTP_ZIMG_QKNORM_ROPE_USERDATA_FLAG_BITS) - 1u,
+};
+
+static inline uintptr_t ggml_htp_zimg_qknorm_rope_pack_userdata(uint32_t flags, uint32_t theta_start) {
+    return ((uintptr_t) theta_start << GGML_HTP_ZIMG_QKNORM_ROPE_USERDATA_FLAG_BITS) |
+           ((uintptr_t) flags & (uintptr_t) GGML_HTP_ZIMG_QKNORM_ROPE_USERDATA_FLAG_MASK);
+}
+
+static inline uint32_t ggml_htp_zimg_qknorm_rope_unpack_flags(uintptr_t userdata) {
+    return (uint32_t) (userdata & (uintptr_t) GGML_HTP_ZIMG_QKNORM_ROPE_USERDATA_FLAG_MASK);
+}
+
+static inline uint32_t ggml_htp_zimg_qknorm_rope_unpack_theta_start(uintptr_t userdata) {
+    return (uint32_t) (userdata >> GGML_HTP_ZIMG_QKNORM_ROPE_USERDATA_FLAG_BITS);
+}
+
 enum ggml_htp_flash_attn_flags {
     GGML_HTP_FLASH_ATTN_FLAG_Q_ROW_MAJOR = 1u << 8,
     GGML_HTP_FLASH_ATTN_FLAG_K_ROW_MAJOR = 1u << 9,

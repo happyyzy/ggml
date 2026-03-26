@@ -94,5 +94,6 @@ struct ZimgQkNormRopeParams {
   int32_t  src_nb1;
   int32_t  src_nb2;
   int32_t  src_nb3;
+  int32_t  theta_start;
   uint32_t flags;
 } __attribute__((packed));

@@ -23,6 +23,7 @@
 
 #include "ggml-backend-impl.h"
 #include "ggml-cpu.h"
+#include "ggml-impl.h"
 #include "dsprpc_interface.h"
 #include "ggml-htp-impl.h"
 #include "ggml-htp.h"
@@ -204,6 +205,12 @@ static inline uint32_t htp_zimg_qknorm_rope_flags(const ggml_tensor * dst) {
     return std::strcmp(dst->name, GGML_HTP_ZIMG_QKNORM_ROPE_INTERLEAVED_NAME) == 0 ? HTP_ZIMG_ROPE_FLAG_INTERLEAVED : 0u;
 }
 
+static inline uint32_t htp_zimg_qknorm_rope_theta_start(const ggml_tensor * dst) {
+    struct ggml_map_custom3_op_params params;
+    std::memcpy(&params, dst->op_params, sizeof(params));
+    return ggml_htp_zimg_qknorm_rope_unpack_theta_start(reinterpret_cast<uintptr_t>(params.userdata));
+}
+
 static inline bool htp_zimg_rope_contract_ok(const ggml_tensor * dst) {
     if (!htp_is_zimg_rope_op(dst)) {
         return false;
@@ -245,6 +252,7 @@ static inline bool htp_zimg_qknorm_rope_contract_ok(const ggml_tensor * dst) {
     if (src == nullptr || weight == nullptr || theta == nullptr) {
         return false;
     }
+    const uint32_t theta_start = htp_zimg_qknorm_rope_theta_start(dst);
 
     constexpr size_t kVecAlign = 128;
     auto ptr_aligned = [](const void * ptr, size_t align) {
@@ -268,7 +276,7 @@ static inline bool htp_zimg_qknorm_rope_contract_ok(const ggml_tensor * dst) {
                           weight->ne[2] * weight->ne[3] == dst->ne[2] * dst->ne[3] &&
                           theta->ne[0] == 2 && theta->ne[1] == 2 &&
                           theta->ne[2] * 2 == dst->ne[0] &&
-                          theta->ne[3] == dst->ne[1];
+                          theta->ne[3] >= (int64_t) theta_start + dst->ne[1];
     const bool src_layout_ok = src->nb[0] == sizeof(float) &&
                                stride_mul_float(src->nb[1]) &&
                                stride_mul_float(src->nb[2]) &&
@@ -957,7 +965,7 @@ bool htp_dump_raw_bytes_tensor_to_file(const std::string & path, const char * na
 
 void htp_flash_dump_tensors(int idx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v,
                             const ggml_tensor * mask, const ggml_tensor * dst, float scale, float max_bias,
-                            float logit_softcap) {
+                            float logit_softcap, uint32_t flags, float kv_scale) {
     const std::string base = std::string(htp_flash_dump_dir()) + "/htp_flash_" + std::to_string(idx);
     const bool q_ok = htp_dump_tensor_to_file(base + "_q.tensor", "q", q);
     const bool k_ok = htp_dump_tensor_to_file(base + "_k.tensor", "k", k);
@@ -972,27 +980,38 @@ void htp_flash_dump_tensors(int idx, const ggml_tensor * q, const ggml_tensor * 
     if (meta != nullptr) {
         std::fprintf(meta, "idx=%d\n", idx);
         std::fprintf(meta, "scale=%g max_bias=%g logit_softcap=%g\n", scale, max_bias, logit_softcap);
+        std::fprintf(meta, "flags=0x%08x kv_scale=%g\n", flags, kv_scale);
         if (q != nullptr) {
             std::fprintf(meta, "q_type=%s q_ne=[%ld,%ld,%ld,%ld]\n",
                          ggml_type_name(q->type), q->ne[0], q->ne[1], q->ne[2], q->ne[3]);
+            std::fprintf(meta, "q_nb=[%zu,%zu,%zu,%zu]\n",
+                         (size_t) q->nb[0], (size_t) q->nb[1], (size_t) q->nb[2], (size_t) q->nb[3]);
         }
         if (k != nullptr) {
             std::fprintf(meta, "k_type=%s k_ne=[%ld,%ld,%ld,%ld]\n",
                          ggml_type_name(k->type), k->ne[0], k->ne[1], k->ne[2], k->ne[3]);
+            std::fprintf(meta, "k_nb=[%zu,%zu,%zu,%zu]\n",
+                         (size_t) k->nb[0], (size_t) k->nb[1], (size_t) k->nb[2], (size_t) k->nb[3]);
         }
         if (v != nullptr) {
             std::fprintf(meta, "v_type=%s v_ne=[%ld,%ld,%ld,%ld]\n",
                          ggml_type_name(v->type), v->ne[0], v->ne[1], v->ne[2], v->ne[3]);
+            std::fprintf(meta, "v_nb=[%zu,%zu,%zu,%zu]\n",
+                         (size_t) v->nb[0], (size_t) v->nb[1], (size_t) v->nb[2], (size_t) v->nb[3]);
         }
         if (mask != nullptr) {
             std::fprintf(meta, "mask_type=%s mask_ne=[%ld,%ld,%ld,%ld]\n",
                          ggml_type_name(mask->type), mask->ne[0], mask->ne[1], mask->ne[2], mask->ne[3]);
+            std::fprintf(meta, "mask_nb=[%zu,%zu,%zu,%zu]\n",
+                         (size_t) mask->nb[0], (size_t) mask->nb[1], (size_t) mask->nb[2], (size_t) mask->nb[3]);
         } else {
             std::fprintf(meta, "mask_type=[null]\n");
         }
         if (dst != nullptr) {
             std::fprintf(meta, "o_type=%s o_ne=[%ld,%ld,%ld,%ld]\n",
                          ggml_type_name(dst->type), dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3]);
+            std::fprintf(meta, "o_nb=[%zu,%zu,%zu,%zu]\n",
+                         (size_t) dst->nb[0], (size_t) dst->nb[1], (size_t) dst->nb[2], (size_t) dst->nb[3]);
         }
         std::fprintf(meta, "dump_ok=q:%d k:%d v:%d mask:%d o:%d\n",
                      q_ok ? 1 : 0, k_ok ? 1 : 0, v_ok ? 1 : 0, m_ok ? 1 : 0, o_ok ? 1 : 0);
@@ -1109,6 +1128,24 @@ bool htp_force_permute_name_from_env(const char * name) {
     return true;
 }
 
+bool htp_contract_export_permute_enabled() {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char * env = std::getenv("GGML_HTP_CONTRACT_EXPORT_PERMUTE");
+        enabled = (env && env[0] != '\0' && std::strcmp(env, "0") != 0 && std::strcmp(env, "false") != 0) ? 1 : 0;
+    }
+    return enabled != 0;
+}
+
+bool htp_contract_export_repack_enabled() {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char * env = std::getenv("GGML_HTP_CONTRACT_EXPORT_REPACK");
+        enabled = (env && env[0] != '\0' && std::strcmp(env, "0") != 0 && std::strcmp(env, "false") != 0) ? 1 : 0;
+    }
+    return enabled != 0;
+}
+
 bool htp_skip_qkv_permute_repack(const ggml_tensor * weight) {
     if (!weight) {
         return false;
@@ -1131,7 +1168,15 @@ bool htp_skip_qkv_permute_repack(const ggml_tensor * weight) {
     static int enabled = -1;
     if (enabled < 0) {
         const char * env = std::getenv("GGML_HTP_SKIP_CORE_PERMUTE_REPACK");
-        enabled = (!env || env[0] == '\0' || std::strcmp(env, "0") != 0) ? 1 : 0;
+        if (env && env[0] != '\0') {
+            enabled = (std::strcmp(env, "0") != 0) ? 1 : 0;
+        } else {
+            // Contract-exported HMX GGUFs already store the core weights in the
+            // target permuted/repacked basis. In that case the runtime must use
+            // the permuted op family directly instead of routing them through
+            // the common-layout path.
+            enabled = (htp_contract_export_permute_enabled() || htp_contract_export_repack_enabled()) ? 0 : 1;
+        }
     }
     if (!enabled) {
         return false;
@@ -3594,7 +3639,7 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                 flash_q = q;
                 flash_k = k;
                 flash_v = v;
-                flash_mask = graph_mask;
+                flash_mask = mask;
                 flash_scale = *reinterpret_cast<const float *>(&dst->op_params[0]);
                 flash_max_bias = *reinterpret_cast<const float *>(&dst->op_params[1]);
                 flash_logit_softcap = *reinterpret_cast<const float *>(&dst->op_params[2]);
@@ -3728,6 +3773,7 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                 const auto src_nb1 = static_cast<int32_t>(src->nb[1] / sizeof(float));
                 const auto src_nb2 = static_cast<int32_t>(src->nb[2] / sizeof(float));
                 const auto src_nb3 = static_cast<int32_t>(src->nb[3] / sizeof(float));
+                const auto theta_start = static_cast<int32_t>(htp_zimg_qknorm_rope_theta_start(dst));
 
                 ZimgQkNormRopeParams params{
                     .output         = { out_fd,    (int32_t) out_offset    },
@@ -3741,6 +3787,7 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                     .src_nb1        = src_nb1,
                     .src_nb2        = src_nb2,
                     .src_nb3        = src_nb3,
+                    .theta_start    = theta_start,
                     .flags          = htp_zimg_qknorm_rope_flags(dst),
                 };
                 *reinterpret_cast<ZimgQkNormRopeParams *>(param_buf) = params;
@@ -3829,8 +3876,17 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
     }
 
     if (state == 0 && flash_dump_armed && flash_q != nullptr && flash_k != nullptr && flash_v != nullptr) {
-        htp_flash_dump_tensors(flash_dump_idx, flash_q, flash_k, flash_v, flash_mask, dst,
-                               flash_scale, flash_max_bias, flash_logit_softcap);
+        htp_flash_dump_tensors(flash_dump_idx,
+                               flash_q,
+                               flash_k,
+                               flash_v,
+                               flash_mask,
+                               dst,
+                               flash_scale,
+                               flash_max_bias,
+                               flash_logit_softcap,
+                               *reinterpret_cast<const uint32_t *>(&dst->op_params[4]),
+                               *reinterpret_cast<const float *>(&dst->op_params[5]));
     }
 
     if (state == 0 && flash_hash_trace_armed && flash_q != nullptr && flash_k != nullptr && flash_v != nullptr) {
