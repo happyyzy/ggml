@@ -961,7 +961,7 @@ static inline bool htp_flux_ss_linear2_contract_ok(const ggml_tensor * dst) {
         return false;
     }
 
-    if (total_k >= 16384) {
+    if (total_k > 16384) {
         return false;
     }
 
@@ -1193,6 +1193,16 @@ bool htp_force_permute_name_from_env(const char * name) {
     return true;
 }
 
+static inline bool htp_is_zimg_exported_core_weight(const char * name) {
+    if (name == nullptr || name[0] == '\0') {
+        return false;
+    }
+    return std::strstr(name, "model.diffusion_model.context_refiner.") != nullptr ||
+           std::strstr(name, "model.diffusion_model.noise_refiner.") != nullptr ||
+           std::strstr(name, "diffusion_model.context_refiner.") != nullptr ||
+           std::strstr(name, "diffusion_model.noise_refiner.") != nullptr;
+}
+
 bool htp_contract_export_permute_enabled() {
     static int enabled = -1;
     if (enabled < 0) {
@@ -1230,20 +1240,25 @@ bool htp_skip_qkv_permute_repack(const ggml_tensor * weight) {
         return true;
     }
 
-    static int enabled = -1;
-    if (enabled < 0) {
+    static int env_override = -2;
+    if (env_override == -2) {
         const char * env = std::getenv("GGML_HTP_SKIP_CORE_PERMUTE_REPACK");
         if (env && env[0] != '\0') {
-            enabled = (std::strcmp(env, "0") != 0) ? 1 : 0;
+            env_override = (std::strcmp(env, "0") != 0) ? 1 : 0;
         } else {
-            // Contract-exported HMX GGUFs already store the core weights in the
-            // target permuted/repacked basis. In that case the runtime must use
-            // the permuted op family directly instead of routing them through
-            // the common-layout path.
-            enabled = (htp_contract_export_permute_enabled() || htp_contract_export_repack_enabled()) ? 0 : 1;
+            env_override = -1;
         }
     }
-    if (!enabled) {
+    if (env_override == 0) {
+        return false;
+    }
+    if (env_override < 0 &&
+        (htp_contract_export_permute_enabled() || htp_contract_export_repack_enabled() ||
+         htp_is_zimg_exported_core_weight(name))) {
+        // fix1 z-image exported context/noise-refiner GGUFs already store the
+        // core qkv/out/w1/w2/w3 weights in the target permuted/repacked basis.
+        // Default these weights to the permuted contract unless the user
+        // explicitly forces the common path via GGML_HTP_SKIP_CORE_PERMUTE_REPACK=1.
         return false;
     }
     // Task-2 mainline requires W2 q8 out_stationary to stay on the permuted route.
