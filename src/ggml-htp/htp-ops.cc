@@ -157,6 +157,7 @@ static inline const char * htp_matmul_op_name(int op_index) {
         case HTP_OPS_MAT_MUL_COMMON_W4D16A32:          return "W4D16A32_COMMON";
         case HTP_OPS_MAT_MUL_COMMON_W8D16A32:          return "W8D16A32_COMMON";
         case HTP_OPS_MAT_MUL_COMMON_W4D16A32_IQ4_NL:   return "W4D16A32_IQ4_NL_COMMON";
+        case HTP_OPS_FLUX_SS_LINEAR2_FUSED_Q8:         return "FLUX_SS_LINEAR2_FUSED_Q8";
         default:                                      return "UNKNOWN";
     }
 }
@@ -195,6 +196,12 @@ static inline bool htp_is_zimg_qknorm_rope_op(const ggml_tensor * dst) {
     }
     return std::strcmp(dst->name, GGML_HTP_ZIMG_QKNORM_ROPE_INTERLEAVED_NAME) == 0 ||
            std::strcmp(dst->name, GGML_HTP_ZIMG_QKNORM_ROPE_NEOX_NAME) == 0;
+}
+
+static inline bool htp_is_flux_ss_linear2_fused_op(const ggml_tensor * dst) {
+    return dst != nullptr &&
+           dst->op == GGML_OP_MAP_CUSTOM3 &&
+           std::strcmp(dst->name, GGML_HTP_FLUX_SS_LINEAR2_FUSED_NAME) == 0;
 }
 
 static inline uint32_t htp_zimg_rope_flags(const ggml_tensor * dst) {
@@ -900,6 +907,64 @@ bool htp_dump_raw_f32_to_file(const std::string & path, const char * name, const
     std::fwrite(data, 1, nbytes, f);
     std::fflush(f);
     std::fclose(f);
+    return true;
+}
+
+static inline bool htp_flux_ss_linear2_contract_ok(const ggml_tensor * dst) {
+    if (!htp_is_flux_ss_linear2_fused_op(dst)) {
+        return false;
+    }
+
+    const ggml_tensor * attn   = dst->src[0];
+    const ggml_tensor * mlp    = dst->src[1];
+    const ggml_tensor * weight = dst->src[2];
+
+    if (attn == nullptr || mlp == nullptr || weight == nullptr) {
+        return false;
+    }
+
+    if (dst->type != GGML_TYPE_F32 || attn->type != GGML_TYPE_F32 || mlp->type != GGML_TYPE_F32 ||
+        weight->type != GGML_TYPE_Q8_0) {
+        return false;
+    }
+
+    if (!ggml_is_contiguous(dst) || !ggml_is_contiguous(attn) || !ggml_is_contiguous(mlp) || !ggml_is_contiguous(weight)) {
+        return false;
+    }
+
+    constexpr size_t kVecAlign = 128;
+    auto ptr_aligned = [](const void * ptr, size_t align) {
+        return ptr != nullptr && (reinterpret_cast<uintptr_t>(ptr) % align) == 0;
+    };
+    if (!ptr_aligned(dst->data, kVecAlign) || !ptr_aligned(attn->data, kVecAlign) ||
+        !ptr_aligned(mlp->data, kVecAlign) || !ptr_aligned(weight->data, kVecAlign)) {
+        return false;
+    }
+
+    if (dst->ne[1] != attn->ne[1] || dst->ne[2] != attn->ne[2] || dst->ne[3] != attn->ne[3]) {
+        return false;
+    }
+    if (attn->ne[1] != mlp->ne[1] || attn->ne[2] != mlp->ne[2] || attn->ne[3] != mlp->ne[3]) {
+        return false;
+    }
+
+    const int64_t attn_k = attn->ne[0];
+    const int64_t mlp_k  = mlp->ne[0];
+    const int64_t n      = dst->ne[0];
+    const int64_t total_k = attn_k + mlp_k;
+
+    if (weight->ne[0] != total_k || weight->ne[1] != n) {
+        return false;
+    }
+
+    if ((attn_k % 32) != 0 || (mlp_k % 32) != 0 || (n % 32) != 0 || (total_k % 32) != 0) {
+        return false;
+    }
+
+    if (total_k >= 16384) {
+        return false;
+    }
+
     return true;
 }
 
@@ -3379,15 +3444,22 @@ bool htp_ops_support_op(const struct ggml_tensor * dst) {
             }
         case GGML_OP_MAP_CUSTOM3:
             {
-                if (!htp_is_zimg_qknorm_rope_op(dst)) {
-                    htp_fallback_record(HtpFallbackReason::kUnknownOp, dst);
-                    return false;
+                if (htp_is_zimg_qknorm_rope_op(dst)) {
+                    if (!htp_zimg_qknorm_rope_contract_ok(dst)) {
+                        htp_fallback_record(HtpFallbackReason::kUnknownOp, dst);
+                        return false;
+                    }
+                    return true;
                 }
-                if (!htp_zimg_qknorm_rope_contract_ok(dst)) {
-                    htp_fallback_record(HtpFallbackReason::kUnknownOp, dst);
-                    return false;
+                if (htp_is_flux_ss_linear2_fused_op(dst)) {
+                    if (!htp_flux_ss_linear2_contract_ok(dst)) {
+                        htp_fallback_record(HtpFallbackReason::kUnknownOp, dst);
+                        return false;
+                    }
+                    return true;
                 }
-                return true;
+                htp_fallback_record(HtpFallbackReason::kUnknownOp, dst);
+                return false;
             }
         default:
             htp_fallback_record(HtpFallbackReason::kUnknownOp, dst);
@@ -3759,41 +3831,74 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
             break;
         case GGML_OP_MAP_CUSTOM3:
             {
-                GGML_ASSERT(htp_is_zimg_qknorm_rope_op(dst));
-                GGML_ASSERT(htp_zimg_qknorm_rope_contract_ok(dst));
-                auto * src    = dst->src[0];
+                if (htp_is_zimg_qknorm_rope_op(dst)) {
+                    GGML_ASSERT(htp_zimg_qknorm_rope_contract_ok(dst));
+                    auto * src = dst->src[0];
+                    auto mappings = get_all_rpcmem_mappings(dst);
+                    GGML_ASSERT(mappings.size() == 4);
 
+                    auto [out_fd, out_offset]       = mappings[0];
+                    auto [src_fd, src_offset]       = mappings[1];
+                    auto [weight_fd, weight_offset] = mappings[2];
+                    auto [theta_fd, theta_offset]   = mappings[3];
+                    const auto src_nb1 = static_cast<int32_t>(src->nb[1] / sizeof(float));
+                    const auto src_nb2 = static_cast<int32_t>(src->nb[2] / sizeof(float));
+                    const auto src_nb3 = static_cast<int32_t>(src->nb[3] / sizeof(float));
+                    const auto theta_start = static_cast<int32_t>(htp_zimg_qknorm_rope_theta_start(dst));
+
+                    ZimgQkNormRopeParams params{
+                        .output         = { out_fd,    (int32_t) out_offset    },
+                        .input          = { src_fd,    (int32_t) src_offset    },
+                        .weight         = { weight_fd, (int32_t) weight_offset },
+                        .theta          = { theta_fd,  (int32_t) theta_offset  },
+                        .d_head         = (int32_t) dst->ne[0],
+                        .seq_len        = (int32_t) dst->ne[1],
+                        .rows           = (int32_t) (dst->ne[2] * dst->ne[3]),
+                        .rows_per_batch = (int32_t) dst->ne[2],
+                        .src_nb1        = src_nb1,
+                        .src_nb2        = src_nb2,
+                        .src_nb3        = src_nb3,
+                        .theta_start    = theta_start,
+                        .flags          = htp_zimg_qknorm_rope_flags(dst),
+                    };
+                    *reinterpret_cast<ZimgQkNormRopeParams *>(param_buf) = params;
+
+                    op_index  = HTP_OPS_ZIMG_QKNORM_ROPE_F32;
+                    args_size = sizeof(ZimgQkNormRopeParams);
+                    break;
+                }
+
+                GGML_ASSERT(htp_is_flux_ss_linear2_fused_op(dst));
+                GGML_ASSERT(htp_flux_ss_linear2_contract_ok(dst));
+
+                auto * attn   = dst->src[0];
+                auto * mlp    = dst->src[1];
+                auto * weight = dst->src[2];
+
+                GGML_ASSERT(htp_repack_quant_weight_inplace_if_needed(weight));
                 auto mappings = get_all_rpcmem_mappings(dst);
                 GGML_ASSERT(mappings.size() == 4);
 
-                auto [out_fd, out_offset]       = mappings[0];
-                auto [src_fd, src_offset]       = mappings[1];
-                auto [weight_fd, weight_offset] = mappings[2];
-                auto [theta_fd, theta_offset]   = mappings[3];
-                const auto src_nb1 = static_cast<int32_t>(src->nb[1] / sizeof(float));
-                const auto src_nb2 = static_cast<int32_t>(src->nb[2] / sizeof(float));
-                const auto src_nb3 = static_cast<int32_t>(src->nb[3] / sizeof(float));
-                const auto theta_start = static_cast<int32_t>(htp_zimg_qknorm_rope_theta_start(dst));
+                auto [out_fd, out_offset]         = mappings[0];
+                auto [attn_fd, attn_offset]       = mappings[1];
+                auto [mlp_fd, mlp_offset]         = mappings[2];
+                auto [weight_fd, weight_offset]   = mappings[3];
 
-                ZimgQkNormRopeParams params{
-                    .output         = { out_fd,    (int32_t) out_offset    },
-                    .input          = { src_fd,    (int32_t) src_offset    },
-                    .weight         = { weight_fd, (int32_t) weight_offset },
-                    .theta          = { theta_fd,  (int32_t) theta_offset  },
-                    .d_head         = (int32_t) dst->ne[0],
-                    .seq_len        = (int32_t) dst->ne[1],
-                    .rows           = (int32_t) (dst->ne[2] * dst->ne[3]),
-                    .rows_per_batch = (int32_t) dst->ne[2],
-                    .src_nb1        = src_nb1,
-                    .src_nb2        = src_nb2,
-                    .src_nb3        = src_nb3,
-                    .theta_start    = theta_start,
-                    .flags          = htp_zimg_qknorm_rope_flags(dst),
+                FluxSingleStreamLinear2Params params{
+                    .output = { out_fd,    (int32_t) out_offset    },
+                    .attn   = { attn_fd,   (int32_t) attn_offset   },
+                    .mlp    = { mlp_fd,    (int32_t) mlp_offset    },
+                    .weight = { weight_fd, (int32_t) weight_offset },
+                    .m      = (int32_t) ggml_nrows(attn),
+                    .attn_k = (int32_t) attn->ne[0],
+                    .mlp_k  = (int32_t) mlp->ne[0],
+                    .n      = (int32_t) dst->ne[0],
+                    .flags  = 0u,
                 };
-                *reinterpret_cast<ZimgQkNormRopeParams *>(param_buf) = params;
+                *reinterpret_cast<FluxSingleStreamLinear2Params *>(param_buf) = params;
 
-                op_index  = HTP_OPS_ZIMG_QKNORM_ROPE_F32;
-                args_size = sizeof(ZimgQkNormRopeParams);
+                op_index  = HTP_OPS_FLUX_SS_LINEAR2_FUSED_Q8;
+                args_size = sizeof(FluxSingleStreamLinear2Params);
             }
             break;
 

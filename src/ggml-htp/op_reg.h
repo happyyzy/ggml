@@ -17,6 +17,7 @@ enum HtpOpsIndex {
   HTP_OPS_MAT_MUL_COMMON_W4D16A32_IQ4_NL,
   HTP_OPS_ZIMG_ROPE_F32,
   HTP_OPS_ZIMG_QKNORM_ROPE_F32,
+  HTP_OPS_FLUX_SS_LINEAR2_FUSED_Q8,
   HTP_OPS_COUNT,
 };
 
@@ -95,5 +96,17 @@ struct ZimgQkNormRopeParams {
   int32_t  src_nb2;
   int32_t  src_nb3;
   int32_t  theta_start;
+  uint32_t flags;
+} __attribute__((packed));
+
+struct FluxSingleStreamLinear2Params {
+  struct RpcmemBufAddr output;
+  struct RpcmemBufAddr attn;
+  struct RpcmemBufAddr mlp;
+  struct RpcmemBufAddr weight;
+  int32_t m;
+  int32_t attn_k;
+  int32_t mlp_k;
+  int32_t n;
   uint32_t flags;
 } __attribute__((packed));
