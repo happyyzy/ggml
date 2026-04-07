@@ -209,7 +209,25 @@ static inline uint32_t htp_zimg_rope_flags(const ggml_tensor * dst) {
 }
 
 static inline uint32_t htp_zimg_qknorm_rope_flags(const ggml_tensor * dst) {
-    return std::strcmp(dst->name, GGML_HTP_ZIMG_QKNORM_ROPE_INTERLEAVED_NAME) == 0 ? HTP_ZIMG_ROPE_FLAG_INTERLEAVED : 0u;
+    uint32_t flags =
+        std::strcmp(dst->name, GGML_HTP_ZIMG_QKNORM_ROPE_INTERLEAVED_NAME) == 0 ? HTP_ZIMG_ROPE_FLAG_INTERLEAVED : 0u;
+
+    const char * force_scalar_rmsnorm = std::getenv("GGML_HTP_ZIMG_QKNORM_ROPE_FORCE_SCALAR_RMSNORM");
+    if (force_scalar_rmsnorm && force_scalar_rmsnorm[0] && std::strcmp(force_scalar_rmsnorm, "0") != 0) {
+        flags |= HTP_ZIMG_QKNORM_ROPE_FLAG_FORCE_SCALAR_RMSNORM;
+    }
+
+    const char * force_scalar_mul = std::getenv("GGML_HTP_ZIMG_QKNORM_ROPE_FORCE_SCALAR_MUL");
+    if (force_scalar_mul && force_scalar_mul[0] && std::strcmp(force_scalar_mul, "0") != 0) {
+        flags |= HTP_ZIMG_QKNORM_ROPE_FLAG_FORCE_SCALAR_MUL;
+    }
+
+    const char * force_scalar_rope = std::getenv("GGML_HTP_ZIMG_QKNORM_ROPE_FORCE_SCALAR_ROPE");
+    if (force_scalar_rope && force_scalar_rope[0] && std::strcmp(force_scalar_rope, "0") != 0) {
+        flags |= HTP_ZIMG_QKNORM_ROPE_FLAG_FORCE_SCALAR_ROPE;
+    }
+
+    return flags;
 }
 
 static inline uint32_t htp_zimg_qknorm_rope_theta_start(const ggml_tensor * dst) {

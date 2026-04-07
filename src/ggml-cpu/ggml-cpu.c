@@ -1744,9 +1744,12 @@ struct ggml_op_dump_entry {
 struct ggml_op_dump_state {
     bool enabled;
     bool initialized;
+    bool dump_all;
+    bool offload_only;
     char dir[768];
     char tag[96];
     char csv_path[1024];
+    int max_records;
     uint64_t max_total_bytes;
     uint64_t total_bytes;
     FILE * csv;
@@ -1763,7 +1766,10 @@ static bool ggml_op_dump_enabled(void) {
 
     g_ggml_op_dump.initialized = true;
     g_ggml_op_dump.enabled = false;
+    g_ggml_op_dump.dump_all = false;
+    g_ggml_op_dump.offload_only = false;
     g_ggml_op_dump.csv = NULL;
+    g_ggml_op_dump.max_records = 0;
     g_ggml_op_dump.n_entries = 0;
     g_ggml_op_dump.total_bytes = 0;
     g_ggml_op_dump.max_total_bytes = 0;
@@ -1796,6 +1802,24 @@ static bool ggml_op_dump_enabled(void) {
         const double v = strtod(max_bytes, NULL);
         if (v > 0) {
             g_ggml_op_dump.max_total_bytes = (uint64_t) v;
+        }
+    }
+
+    const char * dump_all = getenv("GGML_OP_DUMP_ALL");
+    if (dump_all != NULL && dump_all[0] != '\0' && strcmp(dump_all, "0") != 0) {
+        g_ggml_op_dump.dump_all = true;
+    }
+
+    const char * offload_only = getenv("GGML_OP_DUMP_OFFLOAD_ONLY");
+    if (offload_only != NULL && offload_only[0] != '\0' && strcmp(offload_only, "0") != 0) {
+        g_ggml_op_dump.offload_only = true;
+    }
+
+    const char * max_records = getenv("GGML_OP_DUMP_MAX_RECORDS");
+    if (max_records != NULL && max_records[0] != '\0') {
+        const int v = atoi(max_records);
+        if (v > 0) {
+            g_ggml_op_dump.max_records = v;
         }
     }
 
@@ -1906,13 +1930,21 @@ static void ggml_op_dump_record(const struct ggml_tensor * t, bool offload) {
         return;
     }
 
+    if (g_ggml_op_dump.offload_only && !offload) {
+        return;
+    }
+
+    if (g_ggml_op_dump.max_records > 0 && g_ggml_op_dump.n_entries >= g_ggml_op_dump.max_records) {
+        return;
+    }
+
     char shape[96] = { 0 };
     ggml_op_profile_shape_label(t, shape, sizeof(shape));
     if (shape[0] == '\0') {
         return;
     }
 
-    if (ggml_op_dump_seen(t->op, shape)) {
+    if (!g_ggml_op_dump.dump_all && ggml_op_dump_seen(t->op, shape)) {
         return;
     }
 
