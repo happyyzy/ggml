@@ -1237,6 +1237,12 @@ void ggml_compute_forward_mul_mat(
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
 
+    if ((src0->type == GGML_TYPE_WF8_HMX_PREPACK || src0->type == GGML_TYPE_W16_HMX_PREPACK) &&
+        getenv("GGML_ABORT_ON_PREPACKED_CPU_MULMAT") != NULL) {
+        GGML_ABORT("CPU MUL_MAT received prepacked weight type %s for dst=%s src0=%s src1=%s\n",
+                   ggml_type_name(src0->type), dst->name, src0->name, src1 ? src1->name : "<null>");
+    }
+
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int ith = params->ith;

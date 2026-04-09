@@ -151,6 +151,7 @@ static inline bool htp_trace_matmul_should_log(int m) {
 static inline const char * htp_matmul_op_name(int op_index) {
     switch (op_index) {
         case HTP_OPS_MAT_MUL_PERMUTED_W16A32:          return "W16A32_PERMUTED";
+        case HTP_OPS_MAT_MUL_PERMUTED_WF8A16:          return "WF8A16_PERMUTED";
         case HTP_OPS_MAT_MUL_PERMUTED_W4D16A32:        return "W4D16A32_PERMUTED";
         case HTP_OPS_MAT_MUL_PERMUTED_W8D16A32:        return "W8D16A32_PERMUTED";
         case HTP_OPS_MAT_MUL_PERMUTED_W4D16A32_IQ4_NL: return "W4D16A32_IQ4_NL_PERMUTED";
@@ -3218,6 +3219,18 @@ bool htp_ops_support_op(const struct ggml_tensor * dst) {
                     return false;
                 }
 
+                // WF8 prepacked weight
+                if (dst->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_WF8_HMX_PREPACK &&
+                    activation->type == GGML_TYPE_F32) {
+                    bool shape_ok = shape_ok_common && k % 32 == 0;
+                    if (shape_ok) {
+                        htp_debug_log_supported_matmul(dst, weight, activation);
+                    } else {
+                        htp_debug_log_matmul_skip("wf8-shape", dst, weight, activation);
+                        htp_fallback_record(HtpFallbackReason::kMatmulTypeUnsupported, dst);
+                    }
+                    return shape_ok;
+                }
                 // FP16 weight
                 if (dst->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_F16 && activation->type == GGML_TYPE_F32) {
                     if (!htp_f16_matmul_enabled()) {
@@ -3574,7 +3587,7 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                 auto & mm_debug = htp_matmul_debug_snapshot();
                 static std::atomic<uint64_t> mm_debug_call_counter{ 0 };
                 if (htp_matmul_debug_check_enabled() && (htp_matmul_debug_check_all_enabled() || !mm_debug.done) &&
-                    (weight->type == GGML_TYPE_F16 || weight->type == GGML_TYPE_Q4_0 ||
+                    (weight->type == GGML_TYPE_WF8_HMX_PREPACK || weight->type == GGML_TYPE_F16 || weight->type == GGML_TYPE_Q4_0 ||
                      weight->type == GGML_TYPE_Q8_0 || weight->type == GGML_TYPE_IQ4_NL)) {
                     bool arm_this = true;
                     if (const char * filter = htp_matmul_debug_weight_contains_filter()) {
@@ -3669,7 +3682,10 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
 
                 args_size = sizeof(MatMulParams);
 
-                if (dst->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_F16 && activation->type == GGML_TYPE_F32) {
+                if (dst->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_WF8_HMX_PREPACK &&
+                           activation->type == GGML_TYPE_F32) {
+                    op_index = HTP_OPS_MAT_MUL_PERMUTED_WF8A16;
+                } else if (dst->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_F16 && activation->type == GGML_TYPE_F32) {
                     if (prefer_rpc) {
                         using fn_type = int(int, int, int, int, int, int, int, int, int);
 
@@ -3710,7 +3726,8 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                     // Mirror DSP-side heuristic (see htp-ops-lib/src/dsp/ops/mat_mul.c).
                     const bool use_pipeline = (m >= 128) && (k <= n);
                     const bool use_out_stationary =
-                        (weight->type == GGML_TYPE_Q8_0) && (m >= 128) && (k > n) && (n > 1024);
+                        ((weight->type == GGML_TYPE_Q8_0) || (weight->type == GGML_TYPE_WF8_HMX_PREPACK)) &&
+                        (m >= 128) && (k > n) && (n > 1024);
                     const bool is_common_layout =
                         op_index == HTP_OPS_MAT_MUL_COMMON_W4D16A32 ||
                         op_index == HTP_OPS_MAT_MUL_COMMON_W8D16A32 ||
@@ -3942,6 +3959,7 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
     int state = 0;
     bool dispatched = false;
     const bool is_matmul_op =
+        op_index == HTP_OPS_MAT_MUL_PERMUTED_WF8A16 ||
         op_index == HTP_OPS_MAT_MUL_PERMUTED_W16A32 ||
         op_index == HTP_OPS_MAT_MUL_PERMUTED_W4D16A32 ||
         op_index == HTP_OPS_MAT_MUL_PERMUTED_W8D16A32 ||

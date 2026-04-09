@@ -38,7 +38,7 @@ enum htp_data_type {
     HTP_TYPE_Q8_0  = 8,
     HTP_TYPE_I32   = 26,
     HTP_TYPE_I64   = 27,
-    HTP_TYPE_MXFP4 = 39,
+    HTP_TYPE_MXFP4 = 41,
     HTP_TYPE_COUNT
 };
 

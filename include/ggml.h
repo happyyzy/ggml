@@ -426,8 +426,10 @@ extern "C" {
         // GGML_TYPE_IQ4_NL_4_4 = 36,
         // GGML_TYPE_IQ4_NL_4_8 = 37,
         // GGML_TYPE_IQ4_NL_8_8 = 38,
-        GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
-        GGML_TYPE_COUNT   = 40,
+        GGML_TYPE_WF8_HMX_PREPACK = 39, // HMX-consumable compact WF8 prepack
+        GGML_TYPE_W16_HMX_PREPACK = 40, // HMX-consumable compact W16 prepack
+        GGML_TYPE_MXFP4   = 41, // MXFP4 (1 block)
+        GGML_TYPE_COUNT   = 42,
     };
 
     // precision
@@ -462,7 +464,9 @@ extern "C" {
         GGML_FTYPE_MOSTLY_IQ4_XS  = 22, // except 1d tensors
         GGML_FTYPE_MOSTLY_IQ1_M   = 23, // except 1d tensors
         GGML_FTYPE_MOSTLY_BF16    = 24, // except 1d tensors
-        GGML_FTYPE_MOSTLY_MXFP4   = 25, // except 1d tensors
+        GGML_FTYPE_MOSTLY_WF8_HMX = 25, // HMX-consumable compact WF8 prepack
+        GGML_FTYPE_MOSTLY_W16_HMX = 26, // HMX-consumable compact W16 prepack
+        GGML_FTYPE_MOSTLY_MXFP4   = 27, // except 1d tensors
     };
 
     // available tensor operations:
