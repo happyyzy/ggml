@@ -191,12 +191,12 @@ static inline bool htp_is_zimg_rope_op(const ggml_tensor * dst) {
            std::strcmp(dst->name, GGML_HTP_ZIMG_ROPE_NEOX_NAME) == 0;
 }
 
-static inline bool htp_is_zimg_qknorm_rope_op(const ggml_tensor * dst) {
+static inline bool htp_is_dit_qknorm_rope_op(const ggml_tensor * dst) {
     if (dst == nullptr || dst->op != GGML_OP_MAP_CUSTOM3) {
         return false;
     }
-    return std::strcmp(dst->name, GGML_HTP_ZIMG_QKNORM_ROPE_INTERLEAVED_NAME) == 0 ||
-           std::strcmp(dst->name, GGML_HTP_ZIMG_QKNORM_ROPE_NEOX_NAME) == 0;
+    return std::strcmp(dst->name, GGML_HTP_DIT_QKNORM_ROPE_INTERLEAVED_NAME) == 0 ||
+           std::strcmp(dst->name, GGML_HTP_DIT_QKNORM_ROPE_NEOX_NAME) == 0;
 }
 
 static inline bool htp_is_flux_ss_linear2_fused_op(const ggml_tensor * dst) {
@@ -209,32 +209,32 @@ static inline uint32_t htp_zimg_rope_flags(const ggml_tensor * dst) {
     return std::strcmp(dst->name, GGML_HTP_ZIMG_ROPE_INTERLEAVED_NAME) == 0 ? HTP_ZIMG_ROPE_FLAG_INTERLEAVED : 0u;
 }
 
-static inline uint32_t htp_zimg_qknorm_rope_flags(const ggml_tensor * dst) {
+static inline uint32_t htp_dit_qknorm_rope_flags(const ggml_tensor * dst) {
     uint32_t flags =
-        std::strcmp(dst->name, GGML_HTP_ZIMG_QKNORM_ROPE_INTERLEAVED_NAME) == 0 ? HTP_ZIMG_ROPE_FLAG_INTERLEAVED : 0u;
+        std::strcmp(dst->name, GGML_HTP_DIT_QKNORM_ROPE_INTERLEAVED_NAME) == 0 ? HTP_ZIMG_ROPE_FLAG_INTERLEAVED : 0u;
 
-    const char * force_scalar_rmsnorm = std::getenv("GGML_HTP_ZIMG_QKNORM_ROPE_FORCE_SCALAR_RMSNORM");
+    const char * force_scalar_rmsnorm = std::getenv("GGML_HTP_DIT_QKNORM_ROPE_FORCE_SCALAR_RMSNORM");
     if (force_scalar_rmsnorm && force_scalar_rmsnorm[0] && std::strcmp(force_scalar_rmsnorm, "0") != 0) {
-        flags |= HTP_ZIMG_QKNORM_ROPE_FLAG_FORCE_SCALAR_RMSNORM;
+        flags |= HTP_DIT_QKNORM_ROPE_FLAG_FORCE_SCALAR_RMSNORM;
     }
 
-    const char * force_scalar_mul = std::getenv("GGML_HTP_ZIMG_QKNORM_ROPE_FORCE_SCALAR_MUL");
+    const char * force_scalar_mul = std::getenv("GGML_HTP_DIT_QKNORM_ROPE_FORCE_SCALAR_MUL");
     if (force_scalar_mul && force_scalar_mul[0] && std::strcmp(force_scalar_mul, "0") != 0) {
-        flags |= HTP_ZIMG_QKNORM_ROPE_FLAG_FORCE_SCALAR_MUL;
+        flags |= HTP_DIT_QKNORM_ROPE_FLAG_FORCE_SCALAR_MUL;
     }
 
-    const char * force_scalar_rope = std::getenv("GGML_HTP_ZIMG_QKNORM_ROPE_FORCE_SCALAR_ROPE");
+    const char * force_scalar_rope = std::getenv("GGML_HTP_DIT_QKNORM_ROPE_FORCE_SCALAR_ROPE");
     if (force_scalar_rope && force_scalar_rope[0] && std::strcmp(force_scalar_rope, "0") != 0) {
-        flags |= HTP_ZIMG_QKNORM_ROPE_FLAG_FORCE_SCALAR_ROPE;
+        flags |= HTP_DIT_QKNORM_ROPE_FLAG_FORCE_SCALAR_ROPE;
     }
 
     return flags;
 }
 
-static inline uint32_t htp_zimg_qknorm_rope_theta_start(const ggml_tensor * dst) {
+static inline uint32_t htp_dit_qknorm_rope_theta_start(const ggml_tensor * dst) {
     struct ggml_map_custom3_op_params params;
     std::memcpy(&params, dst->op_params, sizeof(params));
-    return ggml_htp_zimg_qknorm_rope_unpack_theta_start(reinterpret_cast<uintptr_t>(params.userdata));
+    return ggml_htp_dit_qknorm_rope_unpack_theta_start(reinterpret_cast<uintptr_t>(params.userdata));
 }
 
 static inline bool htp_zimg_rope_contract_ok(const ggml_tensor * dst) {
@@ -267,8 +267,8 @@ static inline bool htp_zimg_rope_contract_ok(const ggml_tensor * dst) {
     return type_ok && shape_ok && contiguous_ok && aligned_ok;
 }
 
-static inline bool htp_zimg_qknorm_rope_contract_ok(const ggml_tensor * dst) {
-    if (!htp_is_zimg_qknorm_rope_op(dst)) {
+static inline bool htp_dit_qknorm_rope_contract_ok(const ggml_tensor * dst) {
+    if (!htp_is_dit_qknorm_rope_op(dst)) {
         return false;
     }
 
@@ -278,7 +278,7 @@ static inline bool htp_zimg_qknorm_rope_contract_ok(const ggml_tensor * dst) {
     if (src == nullptr || weight == nullptr || theta == nullptr) {
         return false;
     }
-    const uint32_t theta_start = htp_zimg_qknorm_rope_theta_start(dst);
+    const uint32_t theta_start = htp_dit_qknorm_rope_theta_start(dst);
 
     constexpr size_t kVecAlign = 128;
     auto ptr_aligned = [](const void * ptr, size_t align) {
@@ -785,39 +785,6 @@ bool htp_qkv_force_act_q8_copy_f16_enabled() {
 
 bool htp_qkv_force_act_f16_copy_enabled() {
     return htp_env_int_cached("GGML_HTP_QKV_FORCE_ACT_F16_COPY", 0) != 0;
-}
-
-int htp_matmul_split_m() {
-    return htp_env_int_cached("GGML_HTP_MATMUL_SPLIT_M", 0);
-}
-
-int htp_matmul_split_m_for_weight(const ggml_tensor * weight) {
-    int split_m = htp_matmul_split_m();
-    if (!weight) {
-        return split_m;
-    }
-    const char * name = weight->name;
-    if (!name || name[0] == '\0') {
-        return split_m;
-    }
-    // Per-family overrides to allow mixed split policy for DiT core ops.
-    if (std::strstr(name, ".attention.qkv.weight") != nullptr) {
-        return htp_env_int_cached("GGML_HTP_MATMUL_SPLIT_M_QKV", split_m);
-    }
-    if (std::strstr(name, ".attention.out.weight") != nullptr) {
-        return htp_env_int_cached("GGML_HTP_MATMUL_SPLIT_M_OUT", split_m);
-    }
-    if (std::strstr(name, ".feed_forward.w2.weight") != nullptr) {
-        return htp_env_int_cached("GGML_HTP_MATMUL_SPLIT_M_W2", split_m);
-    }
-    if (std::strstr(name, ".feed_forward.w1.weight") != nullptr ||
-        std::strstr(name, ".feed_forward.w3.weight") != nullptr) {
-        return htp_env_int_cached("GGML_HTP_MATMUL_SPLIT_M_W13", split_m);
-    }
-    if (std::strstr(name, ".adaLN_modulation.") != nullptr) {
-        return htp_env_int_cached("GGML_HTP_MATMUL_SPLIT_M_ADALN", split_m);
-    }
-    return split_m;
 }
 
 int htp_flash_dump_max() {
@@ -3490,8 +3457,8 @@ bool htp_ops_support_op(const struct ggml_tensor * dst) {
             }
         case GGML_OP_MAP_CUSTOM3:
             {
-                if (htp_is_zimg_qknorm_rope_op(dst)) {
-                    if (!htp_zimg_qknorm_rope_contract_ok(dst)) {
+                if (htp_is_dit_qknorm_rope_op(dst)) {
+                    if (!htp_dit_qknorm_rope_contract_ok(dst)) {
                         htp_fallback_record(HtpFallbackReason::kUnknownOp, dst);
                         return false;
                     }
@@ -3881,8 +3848,8 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
             break;
         case GGML_OP_MAP_CUSTOM3:
             {
-                if (htp_is_zimg_qknorm_rope_op(dst)) {
-                    GGML_ASSERT(htp_zimg_qknorm_rope_contract_ok(dst));
+                if (htp_is_dit_qknorm_rope_op(dst)) {
+                    GGML_ASSERT(htp_dit_qknorm_rope_contract_ok(dst));
                     auto * src = dst->src[0];
                     auto mappings = get_all_rpcmem_mappings(dst);
                     GGML_ASSERT(mappings.size() == 4);
@@ -3894,9 +3861,9 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                     const auto src_nb1 = static_cast<int32_t>(src->nb[1] / sizeof(float));
                     const auto src_nb2 = static_cast<int32_t>(src->nb[2] / sizeof(float));
                     const auto src_nb3 = static_cast<int32_t>(src->nb[3] / sizeof(float));
-                    const auto theta_start = static_cast<int32_t>(htp_zimg_qknorm_rope_theta_start(dst));
+                    const auto theta_start = static_cast<int32_t>(htp_dit_qknorm_rope_theta_start(dst));
 
-                    ZimgQkNormRopeParams params{
+                    DitQkNormRopeParams params{
                         .output         = { out_fd,    (int32_t) out_offset    },
                         .input          = { src_fd,    (int32_t) src_offset    },
                         .weight         = { weight_fd, (int32_t) weight_offset },
@@ -3909,12 +3876,12 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                         .src_nb2        = src_nb2,
                         .src_nb3        = src_nb3,
                         .theta_start    = theta_start,
-                        .flags          = htp_zimg_qknorm_rope_flags(dst),
+                        .flags          = htp_dit_qknorm_rope_flags(dst),
                     };
-                    *reinterpret_cast<ZimgQkNormRopeParams *>(param_buf) = params;
+                    *reinterpret_cast<DitQkNormRopeParams *>(param_buf) = params;
 
-                    op_index  = HTP_OPS_ZIMG_QKNORM_ROPE_F32;
-                    args_size = sizeof(ZimgQkNormRopeParams);
+                    op_index  = HTP_OPS_DIT_QKNORM_ROPE_F32;
+                    args_size = sizeof(DitQkNormRopeParams);
                     break;
                 }
 
@@ -3967,47 +3934,6 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
         op_index == HTP_OPS_MAT_MUL_COMMON_W4D16A32 ||
         op_index == HTP_OPS_MAT_MUL_COMMON_W8D16A32 ||
         op_index == HTP_OPS_MAT_MUL_COMMON_W4D16A32_IQ4_NL;
-
-    if (is_matmul_op && matmul_params_ready) {
-        const int split_m = htp_matmul_split_m_for_weight(matmul_weight);
-        if (split_m > 0 && matmul_params.m > split_m) {
-            const int m = matmul_params.m;
-            const int k = matmul_params.k;
-            const int n = matmul_params.n;
-            const int32_t out_off_base = matmul_params.output.offset;
-            const int32_t act_off_base = matmul_params.activation.offset;
-            const int64_t out_row_bytes = (int64_t) n * (int64_t) sizeof(float);
-            const int64_t act_row_bytes = (int64_t) k * (int64_t) sizeof(float);
-            for (int row0 = 0; row0 < m; row0 += split_m) {
-                MatMulParams chunk = matmul_params;
-                chunk.m = std::min(split_m, m - row0);
-                const int64_t out_off = (int64_t) out_off_base + (int64_t) row0 * out_row_bytes;
-                const int64_t act_off = (int64_t) act_off_base + (int64_t) row0 * act_row_bytes;
-                if (out_off > INT32_MAX || act_off > INT32_MAX) {
-                    if (htp_debug_enabled()) {
-                        fprintf(stderr,
-                                "matmul split-m overflow: m=%d split=%d row0=%d out_off=%lld act_off=%lld\n",
-                                m, split_m, row0, (long long) out_off, (long long) act_off);
-                    }
-                    state = -1;
-                    break;
-                }
-                chunk.output.offset = (int32_t) out_off;
-                chunk.activation.offset = (int32_t) act_off;
-                state = htp_ops_issue_request(ctx, op_index, &chunk, sizeof(chunk));
-                if (state != 0) {
-                    break;
-                }
-            }
-            dispatched = true;
-            if (htp_debug_enabled()) {
-                fprintf(stderr, "HTP matmul split-m dispatched: m=%d split=%d k=%d n=%d w_name=%s state=%d\n",
-                        m, split_m, k, n,
-                        (matmul_weight && matmul_weight->name[0] != '\0') ? matmul_weight->name : "<unnamed>",
-                        state);
-            }
-        }
-    }
 
     if (!dispatched) {
         state = htp_ops_issue_request(ctx, op_index, param_buf, args_size);

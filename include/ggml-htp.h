@@ -18,30 +18,30 @@ bool ggml_backend_buft_is_rpcmem(ggml_backend_buffer_type_t buft);
 
 #define GGML_HTP_ZIMG_ROPE_INTERLEAVED_NAME "htp_zimg_rope_interleaved"
 #define GGML_HTP_ZIMG_ROPE_NEOX_NAME        "htp_zimg_rope_neox"
-#define GGML_HTP_ZIMG_QKNORM_ROPE_INTERLEAVED_NAME "htp_zimg_qknorm_rope_interleaved"
-#define GGML_HTP_ZIMG_QKNORM_ROPE_NEOX_NAME        "htp_zimg_qknorm_rope_neox"
+#define GGML_HTP_DIT_QKNORM_ROPE_INTERLEAVED_NAME "htp_dit_qknorm_rope_interleaved"
+#define GGML_HTP_DIT_QKNORM_ROPE_NEOX_NAME        "htp_dit_qknorm_rope_neox"
 #define GGML_HTP_FLUX_SS_LINEAR2_FUSED_NAME        "htp_flux_ss_linear2_fused"
 
 enum ggml_htp_zimg_rope_flags {
     GGML_HTP_ZIMG_ROPE_FLAG_INTERLEAVED = 1u << 0,
 };
 
-enum ggml_htp_zimg_qknorm_rope_userdata_layout {
-    GGML_HTP_ZIMG_QKNORM_ROPE_USERDATA_FLAG_BITS = 16,
-    GGML_HTP_ZIMG_QKNORM_ROPE_USERDATA_FLAG_MASK = (1u << GGML_HTP_ZIMG_QKNORM_ROPE_USERDATA_FLAG_BITS) - 1u,
+enum ggml_htp_dit_qknorm_rope_userdata_layout {
+    GGML_HTP_DIT_QKNORM_ROPE_USERDATA_FLAG_BITS = 16,
+    GGML_HTP_DIT_QKNORM_ROPE_USERDATA_FLAG_MASK = (1u << GGML_HTP_DIT_QKNORM_ROPE_USERDATA_FLAG_BITS) - 1u,
 };
 
-static inline uintptr_t ggml_htp_zimg_qknorm_rope_pack_userdata(uint32_t flags, uint32_t theta_start) {
-    return ((uintptr_t) theta_start << GGML_HTP_ZIMG_QKNORM_ROPE_USERDATA_FLAG_BITS) |
-           ((uintptr_t) flags & (uintptr_t) GGML_HTP_ZIMG_QKNORM_ROPE_USERDATA_FLAG_MASK);
+static inline uintptr_t ggml_htp_dit_qknorm_rope_pack_userdata(uint32_t flags, uint32_t theta_start) {
+    return ((uintptr_t) theta_start << GGML_HTP_DIT_QKNORM_ROPE_USERDATA_FLAG_BITS) |
+           ((uintptr_t) flags & (uintptr_t) GGML_HTP_DIT_QKNORM_ROPE_USERDATA_FLAG_MASK);
 }
 
-static inline uint32_t ggml_htp_zimg_qknorm_rope_unpack_flags(uintptr_t userdata) {
-    return (uint32_t) (userdata & (uintptr_t) GGML_HTP_ZIMG_QKNORM_ROPE_USERDATA_FLAG_MASK);
+static inline uint32_t ggml_htp_dit_qknorm_rope_unpack_flags(uintptr_t userdata) {
+    return (uint32_t) (userdata & (uintptr_t) GGML_HTP_DIT_QKNORM_ROPE_USERDATA_FLAG_MASK);
 }
 
-static inline uint32_t ggml_htp_zimg_qknorm_rope_unpack_theta_start(uintptr_t userdata) {
-    return (uint32_t) (userdata >> GGML_HTP_ZIMG_QKNORM_ROPE_USERDATA_FLAG_BITS);
+static inline uint32_t ggml_htp_dit_qknorm_rope_unpack_theta_start(uintptr_t userdata) {
+    return (uint32_t) (userdata >> GGML_HTP_DIT_QKNORM_ROPE_USERDATA_FLAG_BITS);
 }
 
 enum ggml_htp_flash_attn_flags {

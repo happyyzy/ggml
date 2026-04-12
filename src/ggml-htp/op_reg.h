@@ -17,16 +17,16 @@ enum HtpOpsIndex {
   HTP_OPS_MAT_MUL_COMMON_W8D16A32,
   HTP_OPS_MAT_MUL_COMMON_W4D16A32_IQ4_NL,
   HTP_OPS_ZIMG_ROPE_F32,
-  HTP_OPS_ZIMG_QKNORM_ROPE_F32,
+  HTP_OPS_DIT_QKNORM_ROPE_F32,
   HTP_OPS_FLUX_SS_LINEAR2_FUSED_Q8,
   HTP_OPS_COUNT,
 };
 
 enum HtpZimgRopeFlags {
   HTP_ZIMG_ROPE_FLAG_INTERLEAVED = 1u << 0,
-  HTP_ZIMG_QKNORM_ROPE_FLAG_FORCE_SCALAR_RMSNORM = 1u << 16,
-  HTP_ZIMG_QKNORM_ROPE_FLAG_FORCE_SCALAR_MUL     = 1u << 17,
-  HTP_ZIMG_QKNORM_ROPE_FLAG_FORCE_SCALAR_ROPE    = 1u << 18,
+  HTP_DIT_QKNORM_ROPE_FLAG_FORCE_SCALAR_RMSNORM = 1u << 16,
+  HTP_DIT_QKNORM_ROPE_FLAG_FORCE_SCALAR_MUL     = 1u << 17,
+  HTP_DIT_QKNORM_ROPE_FLAG_FORCE_SCALAR_ROPE    = 1u << 18,
 };
 
 enum HtpMatMulFlags {
@@ -97,7 +97,7 @@ struct ZimgRopeParams {
   uint32_t flags;
 } __attribute__((packed));
 
-struct ZimgQkNormRopeParams {
+struct DitQkNormRopeParams {
   struct RpcmemBufAddr output;
   struct RpcmemBufAddr input;
   struct RpcmemBufAddr weight;
