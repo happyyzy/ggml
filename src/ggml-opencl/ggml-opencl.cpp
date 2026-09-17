@@ -844,6 +844,7 @@ struct ggml_backend_opencl_context {
     ggml_opencl_fa_kernels fa;
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
     ggml_cl_adreno_xmem_attn_state adreno_xmem_attn;
+    cl_kernel kernel_qknorm_rope_f32 = nullptr;
 #endif
     cl_kernel kernel_get_rows_f32, kernel_get_rows_f16, kernel_get_rows_q4_0;
     cl_kernel kernel_set_rows_f32_i64, kernel_set_rows_f32_i32, kernel_set_rows_f16_i64, kernel_set_rows_f16_i32;
@@ -2501,6 +2502,24 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             clCreateKernel(program, "adreno_xmem_attn_pv_gemm", &err), err));
         CL_CHECK(clReleaseProgram(program));
         xmem_attn.compiled = true;
+        GGML_LOG_CONT(".");
+    }
+#endif // GGML_OPENCL_USE_ADRENO_KERNELS
+
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+    // qknorm_rope
+    if (backend_ctx->gpu_family == GPU_FAMILY::ADRENO) {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "qknorm_rope.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("qknorm_rope.cl");
+#endif
+        cl_program program = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+        CL_CHECK((backend_ctx->kernel_qknorm_rope_f32 =
+            clCreateKernel(program, "kernel_qknorm_rope_f32", &err), err));
+        CL_CHECK(clReleaseProgram(program));
         GGML_LOG_CONT(".");
     }
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
@@ -8711,6 +8730,30 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             return true;
         case GGML_OP_RMS_NORM:
             return op->ne[0] % 4 == 0 && ggml_is_contiguous_rows(op->src[0]);
+        case GGML_OP_QKNORM_ROPE: {
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+            const ggml_tensor * src    = op->src[0];
+            const ggml_tensor * weight = op->src[1];
+            const ggml_tensor * theta  = op->src[2];
+            if (!src || !weight || !theta) {
+                return false;
+            }
+            const int64_t head_dim = src->ne[0];
+            return backend_ctx->gpu_family == GPU_FAMILY::ADRENO &&
+                   src->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_F32 &&
+                   theta->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                   head_dim > 0 && head_dim <= 256 && head_dim % 64 == 0 &&
+                   src->ne[1] > 0 && src->ne[2] > 0 && src->ne[3] > 0 &&
+                   ggml_nelements(weight) == head_dim &&
+                   ggml_nelements(theta) >= src->ne[2] * 2 * head_dim &&
+                   src->nb[0] == sizeof(float) && ggml_is_contiguous(weight) &&
+                   ggml_is_contiguous(theta) && ggml_is_contiguous(op) &&
+                   op->ne[0] == head_dim && op->ne[1] == src->ne[2] &&
+                   op->ne[2] == src->ne[1] * src->ne[3] && op->ne[3] == 1;
+#else
+            return false;
+#endif
+        }
         case GGML_OP_L2_NORM:
             return ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_REPEAT:
@@ -14674,6 +14717,58 @@ static void ggml_cl_rms_norm(ggml_backend_t backend, const ggml_tensor * src0, c
 
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 }
+
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+static void ggml_cl_qknorm_rope(ggml_backend_t backend, ggml_tensor * dst) {
+    const ggml_tensor * src    = dst->src[0];
+    const ggml_tensor * weight = dst->src[1];
+    const ggml_tensor * theta  = dst->src[2];
+    GGML_ASSERT(src && src->extra && weight && weight->extra && theta && theta->extra && dst->extra);
+
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
+    ggml_tensor_extra_cl * extra_src    = (ggml_tensor_extra_cl *) src->extra;
+    ggml_tensor_extra_cl * extra_weight = (ggml_tensor_extra_cl *) weight->extra;
+    ggml_tensor_extra_cl * extra_theta  = (ggml_tensor_extra_cl *) theta->extra;
+    ggml_tensor_extra_cl * extra_dst    = (ggml_tensor_extra_cl *) dst->extra;
+
+    const cl_ulong src_offset    = extra_src->offset + src->view_offs;
+    const cl_ulong weight_offset = extra_weight->offset + weight->view_offs;
+    const cl_ulong theta_offset  = extra_theta->offset + theta->view_offs;
+    const cl_ulong dst_offset    = extra_dst->offset + dst->view_offs;
+    const cl_ulong src_head_stride   = src->nb[1];
+    const cl_ulong src_token_stride  = src->nb[2];
+    const cl_ulong src_batch_stride  = src->nb[3];
+    const int head_dim = (int) src->ne[0];
+    const int n_heads  = (int) src->ne[1];
+    const int n_tokens = (int) src->ne[2];
+    const cl_ulong theta_token_stride = (cl_ulong) 2 * head_dim * sizeof(float);
+    float eps;
+    memcpy(&eps, dst->op_params, sizeof(eps));
+
+    cl_kernel kernel = backend_ctx->kernel_qknorm_rope_f32;
+    int arg = 0;
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem),   &extra_src->data_device));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &src_offset));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &src_head_stride));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &src_token_stride));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &src_batch_stride));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem),   &extra_weight->data_device));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &weight_offset));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem),   &extra_theta->data_device));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &theta_offset));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &theta_token_stride));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem),   &extra_dst->data_device));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &dst_offset));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(int),      &head_dim));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(int),      &n_heads));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(int),      &n_tokens));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(float),    &eps));
+
+    size_t global_work_size[] = {(size_t) n_heads * 64, (size_t) n_tokens * (size_t) src->ne[3]};
+    size_t local_work_size[]  = {64, 1};
+    backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, dst);
+}
+#endif
 
 static void ggml_opencl_op_rms_norm_fused(ggml_backend_t backend, ggml_tensor * rms_norm_tensor, ggml_tensor * mul_tensor) {
     GGML_ASSERT(mul_tensor);
@@ -28375,6 +28470,16 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
             }
             func = ggml_cl_rms_norm;
             break;
+        case GGML_OP_QKNORM_ROPE:
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+            if (!any_on_device) {
+                return false;
+            }
+            ggml_cl_qknorm_rope(backend, tensor);
+            return true;
+#else
+            return false;
+#endif
         case GGML_OP_L2_NORM:
             if (!any_on_device) {
                 return false;

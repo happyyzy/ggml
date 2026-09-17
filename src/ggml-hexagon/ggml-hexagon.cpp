@@ -2603,19 +2603,11 @@ struct ggml_hexagon_opbatch {
         }
 
         auto * params = (struct htp_conv2d_kernel_params *) last_node.kernel_params;
-        uint32_t new_flags = params->flags;
-        if ((params->flags & HTP_CONV2D_BIAS) == 0) {
-            if (extra->type != GGML_TYPE_F32 || ggml_nelements(extra) != conv_out->ne[2]) {
-                return false;
-            }
-            new_flags |= HTP_CONV2D_BIAS;
-        } else {
-            if ((params->flags & HTP_CONV2D_RESIDUAL) != 0 || conv_out->type != GGML_TYPE_F32 ||
-                extra->type != conv_out->type || !ggml_are_same_shape(extra, conv_out) ||
-                !ggml_is_contiguous(extra) || last_node.inputs[1]->data == node.dst()->data) {
-                return false;
-            }
-            new_flags |= HTP_CONV2D_RESIDUAL;
+        if ((params->flags & HTP_CONV2D_BIAS) == 0 ||
+            (params->flags & HTP_CONV2D_RESIDUAL) != 0 || conv_out->type != GGML_TYPE_F32 ||
+            extra->type != conv_out->type || !ggml_are_same_shape(extra, conv_out) ||
+            !ggml_is_contiguous(extra) || last_node.inputs[1]->data == node.dst()->data) {
+            return false;
         }
 
         size_t extra_bufs = 0;
@@ -2638,7 +2630,7 @@ struct ggml_hexagon_opbatch {
             return false;
         }
 
-        params->flags = new_flags;
+        params->flags |= HTP_CONV2D_RESIDUAL;
         last_node.add_fused(node.node);
         htp_op_desc & o = h_ops[n_ops - 1];
         memcpy(o.kernel_params, last_node.kernel_params, sizeof(o.kernel_params));
@@ -5965,232 +5957,6 @@ static const ggml_tensor * ggml_hexagon_unwrap_empty(const ggml_tensor * tensor)
     return tensor;
 }
 
-static bool ggml_hexagon_has_unwrapped_src(const ggml_tensor * node, const ggml_tensor * src) {
-    for (int i = 0; i < GGML_MAX_SRC; ++i) {
-        if (ggml_hexagon_unwrap_empty(node->src[i]) == src) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static bool ggml_hexagon_match_qknorm_rope(
-        const ggml_cgraph * graph,
-        int start,
-        std::vector<int> & matched,
-        const ggml_tensor ** src,
-        const ggml_tensor ** weight,
-        const ggml_tensor ** theta) {
-    static const ggml_op expected[] = {
-        GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_CONT, GGML_OP_CONT, GGML_OP_REPEAT,
-        GGML_OP_CONT, GGML_OP_MUL, GGML_OP_REPEAT, GGML_OP_MUL, GGML_OP_ADD,
-    };
-    static const ggml_op expected_with_pe_copy[] = {
-        GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_CONT, GGML_OP_CONT, GGML_OP_REPEAT,
-        GGML_OP_CONT, GGML_OP_CONT, GGML_OP_MUL, GGML_OP_REPEAT, GGML_OP_MUL, GGML_OP_ADD,
-    };
-
-    matched.clear();
-    for (int i = start; i < graph->n_nodes && matched.size() < std::size(expected_with_pe_copy); ++i) {
-        if (op_is_compute(graph->nodes[i])) {
-            matched.push_back(i);
-        }
-    }
-    if (matched.size() < std::size(expected)) {
-        return false;
-    }
-
-    bool matches_base = true;
-    for (size_t i = 0; i < std::size(expected); ++i) {
-        if (graph->nodes[matched[i]]->op != expected[i]) {
-            matches_base = false;
-            break;
-        }
-    }
-    if (matches_base) {
-        matched.resize(std::size(expected));
-    } else {
-        if (matched.size() != std::size(expected_with_pe_copy)) {
-            return false;
-        }
-        for (size_t i = 0; i < matched.size(); ++i) {
-            if (graph->nodes[matched[i]]->op != expected_with_pe_copy[i]) {
-                return false;
-            }
-        }
-    }
-
-    const ggml_tensor * rms = graph->nodes[matched[0]];
-    const ggml_tensor * norm_mul = graph->nodes[matched[1]];
-    const ggml_tensor * cont0 = graph->nodes[matched[2]];
-    const ggml_tensor * cont1 = graph->nodes[matched[3]];
-    const ggml_tensor * repeat0 = graph->nodes[matched[4]];
-    const ggml_tensor * pe_copy = matches_base ? nullptr : graph->nodes[matched[5]];
-    const size_t pe_idx = matches_base ? 5 : 6;
-    const ggml_tensor * pe_cont = graph->nodes[matched[pe_idx]];
-    const ggml_tensor * mul0 = graph->nodes[matched[pe_idx + 1]];
-    const ggml_tensor * repeat1 = graph->nodes[matched[pe_idx + 2]];
-    const ggml_tensor * mul1 = graph->nodes[matched[pe_idx + 3]];
-    const ggml_tensor * add = graph->nodes[matched[pe_idx + 4]];
-
-    if (!ggml_hexagon_has_unwrapped_src(norm_mul, rms) ||
-        !ggml_hexagon_has_unwrapped_src(cont0, norm_mul) ||
-        !ggml_hexagon_has_unwrapped_src(cont1, cont0) ||
-        !ggml_hexagon_has_unwrapped_src(repeat0, cont1) ||
-        (pe_copy && !ggml_hexagon_has_unwrapped_src(pe_cont, pe_copy)) ||
-        !ggml_hexagon_has_unwrapped_src(mul0, repeat0) ||
-        !ggml_hexagon_has_unwrapped_src(mul0, pe_cont) ||
-        !ggml_hexagon_has_unwrapped_src(repeat1, cont1) ||
-        !ggml_hexagon_has_unwrapped_src(mul1, repeat1) ||
-        !ggml_hexagon_has_unwrapped_src(mul1, pe_cont) ||
-        !ggml_hexagon_has_unwrapped_src(add, mul0) ||
-        !ggml_hexagon_has_unwrapped_src(add, mul1)) {
-        return false;
-    }
-
-    const ggml_tensor * norm_weight = norm_mul->src[0] == rms ? norm_mul->src[1] : norm_mul->src[0];
-    const ggml_tensor * pe_base = pe_copy ? pe_copy : ggml_hexagon_unwrap_empty(pe_cont->src[0]);
-    if (pe_base && pe_base->op == GGML_OP_CONT && pe_base->ne[0] == 2 && pe_base->ne[1] == 2) {
-        pe_base = ggml_hexagon_unwrap_empty(pe_base->src[0]);
-    }
-    const ggml_tensor * pe = ggml_hexagon_unwrap_empty(pe_base);
-    const ggml_tensor * input = rms->src[0];
-    if (!input || !norm_weight || !pe) {
-        return false;
-    }
-
-    const uint64_t n_output = (uint64_t) input->ne[0] * input->ne[1] * input->ne[2] * input->ne[3];
-    if (input->type != GGML_TYPE_F32 || norm_weight->type != GGML_TYPE_F32 ||
-        pe->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32 ||
-        input->ne[0] <= 0 || input->ne[0] > 256 || input->ne[0] % 64 != 0 ||
-        ggml_nelements(norm_weight) != input->ne[0] || ggml_nelements(add) != (int64_t) n_output ||
-        ggml_nelements(pe) < input->ne[2] * 2 * input->ne[0] ||
-        input->nb[0] != sizeof(float) || !ggml_is_contiguous(add)) {
-        return false;
-    }
-
-    *src = input;
-    *weight = norm_weight;
-    *theta = pe;
-    return true;
-}
-
-static bool ggml_hexagon_fusion_region_is_closed(
-        const ggml_cgraph * graph,
-        int start,
-        int end,
-        std::initializer_list<const ggml_tensor *> outputs) {
-    auto is_output = [&](const ggml_tensor * tensor) {
-        const ggml_tensor * unwrapped = ggml_hexagon_unwrap_empty(tensor);
-        return std::any_of(outputs.begin(), outputs.end(), [&](const ggml_tensor * output) {
-            for (const ggml_tensor * alias = output; alias; alias = alias->view_src) {
-                if (alias == tensor || ggml_hexagon_unwrap_empty(alias) == unwrapped) {
-                    return true;
-                }
-            }
-            return false;
-        });
-    };
-    auto is_internal = [&](const ggml_tensor * tensor) {
-        for (int i = start; i <= end; ++i) {
-            if (graph->nodes[i] == tensor) {
-                return true;
-            }
-        }
-        return false;
-    };
-
-    for (int i = start; i <= end; ++i) {
-        if ((graph->nodes[i]->flags & GGML_TENSOR_FLAG_OUTPUT) && !is_output(graph->nodes[i])) {
-            return false;
-        }
-    }
-    for (int i = end + 1; i < graph->n_nodes; ++i) {
-        const ggml_tensor * consumer = graph->nodes[i];
-        for (int s = 0; s < GGML_MAX_SRC; ++s) {
-            const ggml_tensor * dependency = ggml_hexagon_unwrap_empty(consumer->src[s]);
-            if (dependency && is_internal(dependency) && !is_output(dependency)) {
-                return false;
-            }
-        }
-    }
-    return true;
-}
-
-static htp_opnode ggml_hexagon_make_qknorm_rope_node(
-        const ggml_cgraph * graph,
-        const std::vector<int> & matched,
-        const ggml_tensor * src,
-        const ggml_tensor * weight,
-        const ggml_tensor * theta) {
-    htp_opnode node(HTP_OP_QKNORM_ROPE, graph->nodes[matched[0]]);
-    for (size_t i = 1; i < matched.size(); ++i) {
-        node.add_fused(graph->nodes[matched[i]]);
-    }
-    node.inputs = { src, weight, theta };
-    return node;
-}
-
-static bool ggml_hexagon_fuse_qknorm_rope(
-        const ggml_cgraph * graph,
-        int * node_idx,
-        std::vector<htp_opnode> * nodes) {
-    std::vector<int> matched;
-    const ggml_tensor * src = nullptr;
-    const ggml_tensor * weight = nullptr;
-    const ggml_tensor * theta = nullptr;
-    if (!ggml_hexagon_match_qknorm_rope(graph, *node_idx, matched, &src, &weight, &theta)) {
-        return false;
-    }
-
-    const int end = matched.back();
-    const ggml_tensor * output = graph->nodes[end];
-    if (ggml_hexagon_fusion_region_is_closed(graph, *node_idx, end, { output })) {
-        nodes->push_back(ggml_hexagon_make_qknorm_rope_node(graph, matched, src, weight, theta));
-        *node_idx = end;
-        return true;
-    }
-
-    const bool has_pe_copy = matched.size() == 11;
-    const size_t pe_pos = has_pe_copy ? 6 : 5;
-    ggml_tensor * pe_copy = has_pe_copy ? graph->nodes[matched[5]] : nullptr;
-    ggml_tensor * pe_cont = graph->nodes[matched[pe_pos]];
-    if (ggml_hexagon_fusion_region_is_closed(graph, *node_idx, end, { output, pe_copy, pe_cont })) {
-        if (pe_copy) {
-            nodes->emplace_back(op_remap_to_htp(pe_copy), pe_copy);
-        }
-        nodes->emplace_back(op_remap_to_htp(pe_cont), pe_cont);
-        nodes->push_back(ggml_hexagon_make_qknorm_rope_node(graph, matched, src, weight, theta));
-        *node_idx = end;
-        return true;
-    }
-
-    std::vector<int> matched_k;
-    const ggml_tensor * src_k = nullptr;
-    const ggml_tensor * weight_k = nullptr;
-    const ggml_tensor * theta_k = nullptr;
-    int k_start = end + 1;
-    while (k_start < graph->n_nodes && !op_is_compute(graph->nodes[k_start])) {
-        ++k_start;
-    }
-    if (k_start >= graph->n_nodes ||
-        !ggml_hexagon_match_qknorm_rope(graph, k_start, matched_k, &src_k, &weight_k, &theta_k) ||
-        theta_k != theta) {
-        return false;
-    }
-
-    const int end_k = matched_k.back();
-    const ggml_tensor * output_k = graph->nodes[end_k];
-    if (!ggml_hexagon_fusion_region_is_closed(graph, *node_idx, end_k, { output, output_k })) {
-        return false;
-    }
-
-    nodes->push_back(ggml_hexagon_make_qknorm_rope_node(graph, matched, src, weight, theta));
-    nodes->push_back(ggml_hexagon_make_qknorm_rope_node(graph, matched_k, src_k, weight_k, theta_k));
-    *node_idx = end_k;
-    return true;
-}
-
 static bool mm_is_hmx_eligible(const ggml_tensor * t) {
     if (opt_nhmx == 0) { return false; }
 
@@ -6334,8 +6100,7 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
                 }
             } else if (graph->nodes[i]->op == GGML_OP_SCALE && ggml_node_has_n_uses(graph, i, 1)) {
                 extra->flags |= GGML_HEXAGON_TENSOR_FUSEABLE;
-            } else if ((graph->nodes[i]->op == GGML_OP_CONV_2D ||
-                        graph->nodes[i]->op == GGML_OP_CONV_2D_BIAS ||
+            } else if ((graph->nodes[i]->op == GGML_OP_CONV_2D_BIAS ||
                         graph->nodes[i]->op == GGML_OP_CONV_2D_UPSCALE ||
                         graph->nodes[i]->op == GGML_OP_ADD) &&
                        ggml_node_has_n_uses(graph, i, 1)) {
@@ -6348,10 +6113,6 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
         for (int i = 0; i < graph->n_nodes; ++i) {
             ggml_tensor * n = graph->nodes[i];
             if (!op_is_compute(n)) {
-                continue;
-            }
-
-            if (n->op == GGML_OP_RMS_NORM && ggml_hexagon_fuse_qknorm_rope(graph, &i, &computed_nodes)) {
                 continue;
             }
 
