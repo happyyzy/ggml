@@ -14,7 +14,6 @@ enum htp_conv2d_flags {
     HTP_CONV2D_BIAS     = 1u << 0,
     HTP_CONV2D_RESIDUAL = 1u << 1,
     HTP_CONV2D_UPSCALE2 = 1u << 2,
-    HTP_CONV2D_INPUT_SILU = 1u << 3,
 };
 
 struct htp_conv2d_kernel_params {
@@ -24,18 +23,12 @@ struct htp_conv2d_kernel_params {
     uint32_t k_tiles;
     uint32_t activation_k_tiles;
     uint32_t n_tiles;
-    uint32_t halo_w;
-    uint32_t halo_h;
     uint32_t activation_group_channels;
 
     uint32_t off_weight;
-    uint32_t weight_bytes;
-    uint32_t off_x[2];
-    uint32_t x_slot_bytes;
+    uint32_t off_x;
     uint32_t off_a[2];
-    uint32_t a_slot_bytes;
     uint32_t off_c[2];
-    uint32_t c_slot_bytes;
     uint32_t off_scales;
     uint32_t vtcm_size;
     uint32_t flags;
@@ -53,8 +46,11 @@ static inline uint32_t htp_conv2d_layout_build(
         uint32_t oc,
         uint32_t tile_w,
         uint32_t tile_h,
-        uint32_t n_threads) {
+        uint32_t n_threads,
+        uint32_t input_element_size) {
     const uint32_t k = kh * kw * ic;
+    const uint32_t halo_w = tile_w + kw - 1u;
+    const uint32_t halo_h = tile_h + kh - 1u;
     uint32_t off = 0;
 
     p->tile_w = tile_w;
@@ -64,12 +60,10 @@ static inline uint32_t htp_conv2d_layout_build(
     p->k_tiles = k / 32u;
     p->activation_k_tiles = kw * ic / 32u;
     p->n_tiles = (oc + 31u) / 32u;
-    p->halo_w = tile_w + kw - 1u;
-    p->halo_h = tile_h + kh - 1u;
 
     p->off_weight = off;
-    p->weight_bytes = k * p->n_tiles * 32u * sizeof(uint16_t);
-    off = htp_conv2d_align_up(off + p->weight_bytes, HTP_CONV2D_TILE_BYTES);
+    const uint32_t weight_bytes = k * p->n_tiles * 32u * sizeof(uint16_t);
+    off = htp_conv2d_align_up(off + weight_bytes, HTP_CONV2D_TILE_BYTES);
 
     const uint32_t ic_blocks = ic / 32u;
     uint32_t groups_per_ic_block = 1;
@@ -86,25 +80,23 @@ static inline uint32_t htp_conv2d_layout_build(
         const uint32_t count = last - first;
         x_slots += count < 2u ? count : 2u;
     }
-    const uint32_t x_f32_bytes = x_slots * p->activation_group_channels *
-                                 p->halo_w * p->halo_h * sizeof(float);
-    p->off_x[0] = off;
-    p->x_slot_bytes = x_f32_bytes;
-    off = htp_conv2d_align_up(off + p->x_slot_bytes, HTP_CONV2D_TILE_BYTES);
-    p->off_x[1] = p->off_x[0];
+    const uint32_t x_slot_bytes = x_slots * p->activation_group_channels *
+                                  halo_w * halo_h * input_element_size;
+    p->off_x = off;
+    off = htp_conv2d_align_up(off + x_slot_bytes, HTP_CONV2D_TILE_BYTES);
 
-    p->a_slot_bytes = HTP_CONV2D_TILE_W * (tile_w / HTP_CONV2D_TILE_W) *
-                      p->halo_h * (kw * ic) * sizeof(uint16_t);
+    const uint32_t a_slot_bytes = HTP_CONV2D_TILE_W * (tile_w / HTP_CONV2D_TILE_W) *
+                                  halo_h * (kw * ic) * sizeof(uint16_t);
     for (uint32_t i = 0; i < 2; ++i) {
         p->off_a[i] = off;
-        off = htp_conv2d_align_up(off + p->a_slot_bytes, HTP_CONV2D_TILE_BYTES);
+        off = htp_conv2d_align_up(off + a_slot_bytes, HTP_CONV2D_TILE_BYTES);
     }
 
-    p->c_slot_bytes = HTP_CONV2D_TILE_W * p->m_tiles *
-                      p->n_tiles * 32u * sizeof(uint16_t);
+    const uint32_t c_slot_bytes = HTP_CONV2D_TILE_W * p->m_tiles *
+                                  p->n_tiles * 32u * sizeof(uint16_t);
     for (uint32_t i = 0; i < 2; ++i) {
         p->off_c[i] = off;
-        off = htp_conv2d_align_up(off + p->c_slot_bytes, HTP_CONV2D_TILE_BYTES);
+        off = htp_conv2d_align_up(off + c_slot_bytes, HTP_CONV2D_TILE_BYTES);
     }
 
     p->off_scales = off;

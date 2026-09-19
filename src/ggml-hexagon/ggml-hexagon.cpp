@@ -5572,13 +5572,14 @@ static bool ggml_hexagon_precompute_conv2d_params(
     const uint32_t oc = (uint32_t) op->src[0]->ne[3];
     const uint32_t ow = (uint32_t) op->ne[0];
     const uint32_t oh = (uint32_t) op->ne[1];
+    const uint32_t input_element_size = (uint32_t) ggml_type_size(op->src[1]->type);
     const uint32_t padded_ow =
         (ow + HTP_CONV2D_TILE_W - 1u) & ~(HTP_CONV2D_TILE_W - 1u);
 
     auto max_tile_rows = [&](uint32_t tile_w, struct htp_conv2d_kernel_params * result) {
         struct htp_conv2d_kernel_params candidate;
         if (htp_conv2d_layout_build(&candidate, kh, kw, ic, oc, tile_w, 1,
-                                    sess->n_threads) > sess->vtcm_size) {
+                                    sess->n_threads, input_element_size) > sess->vtcm_size) {
             return 0u;
         }
 
@@ -5587,13 +5588,14 @@ static bool ggml_hexagon_precompute_conv2d_params(
         while (lo < hi) {
             const uint32_t mid = lo + (hi - lo + 1) / 2;
             if (htp_conv2d_layout_build(&candidate, kh, kw, ic, oc, tile_w, mid,
-                                        sess->n_threads) <= sess->vtcm_size) {
+                                        sess->n_threads, input_element_size) <= sess->vtcm_size) {
                 lo = mid;
             } else {
                 hi = mid - 1;
             }
         }
-        htp_conv2d_layout_build(result, kh, kw, ic, oc, tile_w, lo, sess->n_threads);
+        htp_conv2d_layout_build(result, kh, kw, ic, oc, tile_w, lo,
+                                sess->n_threads, input_element_size);
         return lo;
     };
 
@@ -5705,8 +5707,10 @@ static bool ggml_hexagon_supported_group_norm_affine_silu(const struct ggml_tens
     const struct ggml_tensor * src    = op->src[0];
     const struct ggml_tensor * weight = op->src[1];
     const struct ggml_tensor * bias   = op->src[2];
-    if (!src || !weight || !bias || src->type != GGML_TYPE_F16 ||
-        op->type != GGML_TYPE_F16 || weight->type != GGML_TYPE_F32 ||
+    if (!src || !weight || !bias ||
+        !((src->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32) ||
+          (src->type == GGML_TYPE_F16 && op->type == GGML_TYPE_F16)) ||
+        weight->type != GGML_TYPE_F32 ||
         bias->type != GGML_TYPE_F32 || !ggml_is_contiguous(src) ||
         !ggml_is_contiguous(op) || !ggml_is_contiguous(weight) ||
         !ggml_is_contiguous(bias) || !ggml_are_same_shape(src, op) ||
@@ -5716,7 +5720,9 @@ static bool ggml_hexagon_supported_group_norm_affine_silu(const struct ggml_tens
     }
 
     const int32_t groups = ggml_get_op_params_i32(op, 0);
-    return groups > 0 && src->ne[2] % groups == 0;
+    return groups > 0 && src->ne[2] % groups == 0 &&
+           (src->type == GGML_TYPE_F16 ||
+            (src->ne[0] * src->ne[1]) % 32 == 0);
 }
 
 static bool ggml_hexagon_supported_qknorm_rope(const struct ggml_tensor * op) {

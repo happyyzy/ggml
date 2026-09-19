@@ -1,5 +1,3 @@
-#pragma clang diagnostic ignored "-Wunused-function"
-#pragma clang diagnostic ignored "-Wunused-variable"
 
 #include <HAP_farf.h>
 #include <hexagon_protos.h>
@@ -12,169 +10,16 @@
 #include "hex-dma.h"
 #include "hex-profile.h"
 #include "matmul-ops.h"
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-function"
+#pragma clang diagnostic ignored "-Wunused-variable"
 #include "hmx-mm-kernels-tiled.h"
+#pragma clang diagnostic pop
 #include "hmx-utils.h"
 #include "htp-ctx.h"
 #include "htp-ops.h"
 #include "hvx-utils.h"
-#include "hvx-sigmoid.h"
 
-static const uint32_t conv2d_gather_rows_32x32[32] __attribute__((aligned(VLEN))) = {
-    0 * 128,  1 * 128,  2 * 128,  3 * 128,  4 * 128,  5 * 128,  6 * 128,  7 * 128,
-    8 * 128,  9 * 128, 10 * 128, 11 * 128, 12 * 128, 13 * 128, 14 * 128, 15 * 128,
-   16 * 128, 17 * 128, 18 * 128, 19 * 128, 20 * 128, 21 * 128, 22 * 128, 23 * 128,
-   24 * 128, 25 * 128, 26 * 128, 27 * 128, 28 * 128, 29 * 128, 30 * 128, 31 * 128,
-};
-
-static const uint16_t conv2d_scatter_cols_32x32[64] __attribute__((aligned(VLEN))) = {
-     0,    2,  128,  130,  256,  258,  384,  386,
-   512,  514,  640,  642,  768,  770,  896,  898,
-  1024, 1026, 1152, 1154, 1280, 1282, 1408, 1410,
-  1536, 1538, 1664, 1666, 1792, 1794, 1920, 1922,
-     0,    0,    0,    0,    0,    0,    0,    0,
-     0,    0,    0,    0,    0,    0,    0,    0,
-     0,    0,    0,    0,    0,    0,    0,    0,
-     0,    0,    0,    0,    0,    0,    0,    0,
-};
-
-#define CONV2D_PAIR_DECLS(prefix) \
-    HVX_VectorPair prefix##01, prefix##23, prefix##45, prefix##67; \
-    HVX_VectorPair prefix##89, prefix##1011, prefix##1213, prefix##1415; \
-    HVX_VectorPair prefix##1617, prefix##1819, prefix##2021, prefix##2223; \
-    HVX_VectorPair prefix##2425, prefix##2627, prefix##2829, prefix##3031
-
-#define CONV2D_TRANSPOSE_FINISH(STORE_PAIR) do { \
-    CONV2D_PAIR_DECLS(s); \
-    s01   = Q6_W_vshuff_VVR(Q6_V_lo_W(d23),   Q6_V_lo_W(d01),   -8); \
-    s23   = Q6_W_vshuff_VVR(Q6_V_hi_W(d23),   Q6_V_hi_W(d01),   -8); \
-    s45   = Q6_W_vshuff_VVR(Q6_V_lo_W(d67),   Q6_V_lo_W(d45),   -8); \
-    s67   = Q6_W_vshuff_VVR(Q6_V_hi_W(d67),   Q6_V_hi_W(d45),   -8); \
-    s89   = Q6_W_vshuff_VVR(Q6_V_lo_W(d1011), Q6_V_lo_W(d89),   -8); \
-    s1011 = Q6_W_vshuff_VVR(Q6_V_hi_W(d1011), Q6_V_hi_W(d89),   -8); \
-    s1213 = Q6_W_vshuff_VVR(Q6_V_lo_W(d1415), Q6_V_lo_W(d1213), -8); \
-    s1415 = Q6_W_vshuff_VVR(Q6_V_hi_W(d1415), Q6_V_hi_W(d1213), -8); \
-    s1617 = Q6_W_vshuff_VVR(Q6_V_lo_W(d1819), Q6_V_lo_W(d1617), -8); \
-    s1819 = Q6_W_vshuff_VVR(Q6_V_hi_W(d1819), Q6_V_hi_W(d1617), -8); \
-    s2021 = Q6_W_vshuff_VVR(Q6_V_lo_W(d2223), Q6_V_lo_W(d2021), -8); \
-    s2223 = Q6_W_vshuff_VVR(Q6_V_hi_W(d2223), Q6_V_hi_W(d2021), -8); \
-    s2425 = Q6_W_vshuff_VVR(Q6_V_lo_W(d2627), Q6_V_lo_W(d2425), -8); \
-    s2627 = Q6_W_vshuff_VVR(Q6_V_hi_W(d2627), Q6_V_hi_W(d2425), -8); \
-    s2829 = Q6_W_vshuff_VVR(Q6_V_lo_W(d3031), Q6_V_lo_W(d2829), -8); \
-    s3031 = Q6_W_vshuff_VVR(Q6_V_hi_W(d3031), Q6_V_hi_W(d2829), -8); \
-    d01   = Q6_W_vshuff_VVR(Q6_V_lo_W(s45),   Q6_V_lo_W(s01),   -16); \
-    d23   = Q6_W_vshuff_VVR(Q6_V_hi_W(s45),   Q6_V_hi_W(s01),   -16); \
-    d45   = Q6_W_vshuff_VVR(Q6_V_lo_W(s67),   Q6_V_lo_W(s23),   -16); \
-    d67   = Q6_W_vshuff_VVR(Q6_V_hi_W(s67),   Q6_V_hi_W(s23),   -16); \
-    d89   = Q6_W_vshuff_VVR(Q6_V_lo_W(s1213), Q6_V_lo_W(s89),   -16); \
-    d1011 = Q6_W_vshuff_VVR(Q6_V_hi_W(s1213), Q6_V_hi_W(s89),   -16); \
-    d1213 = Q6_W_vshuff_VVR(Q6_V_lo_W(s1415), Q6_V_lo_W(s1011), -16); \
-    d1415 = Q6_W_vshuff_VVR(Q6_V_hi_W(s1415), Q6_V_hi_W(s1011), -16); \
-    d1617 = Q6_W_vshuff_VVR(Q6_V_lo_W(s2021), Q6_V_lo_W(s1617), -16); \
-    d1819 = Q6_W_vshuff_VVR(Q6_V_hi_W(s2021), Q6_V_hi_W(s1617), -16); \
-    d2021 = Q6_W_vshuff_VVR(Q6_V_lo_W(s2223), Q6_V_lo_W(s1819), -16); \
-    d2223 = Q6_W_vshuff_VVR(Q6_V_hi_W(s2223), Q6_V_hi_W(s1819), -16); \
-    d2425 = Q6_W_vshuff_VVR(Q6_V_lo_W(s2829), Q6_V_lo_W(s2425), -16); \
-    d2627 = Q6_W_vshuff_VVR(Q6_V_hi_W(s2829), Q6_V_hi_W(s2425), -16); \
-    d2829 = Q6_W_vshuff_VVR(Q6_V_lo_W(s3031), Q6_V_lo_W(s2627), -16); \
-    d3031 = Q6_W_vshuff_VVR(Q6_V_hi_W(s3031), Q6_V_hi_W(s2627), -16); \
-    s01   = Q6_W_vshuff_VVR(Q6_V_lo_W(d89),   Q6_V_lo_W(d01),   -32); \
-    s23   = Q6_W_vshuff_VVR(Q6_V_hi_W(d89),   Q6_V_hi_W(d01),   -32); \
-    s45   = Q6_W_vshuff_VVR(Q6_V_lo_W(d1011), Q6_V_lo_W(d23),   -32); \
-    s67   = Q6_W_vshuff_VVR(Q6_V_hi_W(d1011), Q6_V_hi_W(d23),   -32); \
-    s89   = Q6_W_vshuff_VVR(Q6_V_lo_W(d1213), Q6_V_lo_W(d45),   -32); \
-    s1011 = Q6_W_vshuff_VVR(Q6_V_hi_W(d1213), Q6_V_hi_W(d45),   -32); \
-    s1213 = Q6_W_vshuff_VVR(Q6_V_lo_W(d1415), Q6_V_lo_W(d67),   -32); \
-    s1415 = Q6_W_vshuff_VVR(Q6_V_hi_W(d1415), Q6_V_hi_W(d67),   -32); \
-    s1617 = Q6_W_vshuff_VVR(Q6_V_lo_W(d2425), Q6_V_lo_W(d1617), -32); \
-    s1819 = Q6_W_vshuff_VVR(Q6_V_hi_W(d2425), Q6_V_hi_W(d1617), -32); \
-    s2021 = Q6_W_vshuff_VVR(Q6_V_lo_W(d2627), Q6_V_lo_W(d1819), -32); \
-    s2223 = Q6_W_vshuff_VVR(Q6_V_hi_W(d2627), Q6_V_hi_W(d1819), -32); \
-    s2425 = Q6_W_vshuff_VVR(Q6_V_lo_W(d2829), Q6_V_lo_W(d2021), -32); \
-    s2627 = Q6_W_vshuff_VVR(Q6_V_hi_W(d2829), Q6_V_hi_W(d2021), -32); \
-    s2829 = Q6_W_vshuff_VVR(Q6_V_lo_W(d3031), Q6_V_lo_W(d2223), -32); \
-    s3031 = Q6_W_vshuff_VVR(Q6_V_hi_W(d3031), Q6_V_hi_W(d2223), -32); \
-    d01 = Q6_W_vshuff_VVR(Q6_V_lo_W(s1617), Q6_V_lo_W(s01), -64); STORE_PAIR( 0, d01); \
-    d01 = Q6_W_vshuff_VVR(Q6_V_hi_W(s1617), Q6_V_hi_W(s01), -64); STORE_PAIR( 1, d01); \
-    d01 = Q6_W_vshuff_VVR(Q6_V_lo_W(s1819), Q6_V_lo_W(s23), -64); STORE_PAIR( 2, d01); \
-    d01 = Q6_W_vshuff_VVR(Q6_V_hi_W(s1819), Q6_V_hi_W(s23), -64); STORE_PAIR( 3, d01); \
-    d01 = Q6_W_vshuff_VVR(Q6_V_lo_W(s2021), Q6_V_lo_W(s45), -64); STORE_PAIR( 4, d01); \
-    d01 = Q6_W_vshuff_VVR(Q6_V_hi_W(s2021), Q6_V_hi_W(s45), -64); STORE_PAIR( 5, d01); \
-    d01 = Q6_W_vshuff_VVR(Q6_V_lo_W(s2223), Q6_V_lo_W(s67), -64); STORE_PAIR( 6, d01); \
-    d01 = Q6_W_vshuff_VVR(Q6_V_hi_W(s2223), Q6_V_hi_W(s67), -64); STORE_PAIR( 7, d01); \
-    d01 = Q6_W_vshuff_VVR(Q6_V_lo_W(s2425), Q6_V_lo_W(s89), -64); STORE_PAIR( 8, d01); \
-    d01 = Q6_W_vshuff_VVR(Q6_V_hi_W(s2425), Q6_V_hi_W(s89), -64); STORE_PAIR( 9, d01); \
-    d01 = Q6_W_vshuff_VVR(Q6_V_lo_W(s2627), Q6_V_lo_W(s1011), -64); STORE_PAIR(10, d01); \
-    d01 = Q6_W_vshuff_VVR(Q6_V_hi_W(s2627), Q6_V_hi_W(s1011), -64); STORE_PAIR(11, d01); \
-    d01 = Q6_W_vshuff_VVR(Q6_V_lo_W(s2829), Q6_V_lo_W(s1213), -64); STORE_PAIR(12, d01); \
-    d01 = Q6_W_vshuff_VVR(Q6_V_hi_W(s2829), Q6_V_hi_W(s1213), -64); STORE_PAIR(13, d01); \
-    d01 = Q6_W_vshuff_VVR(Q6_V_lo_W(s3031), Q6_V_lo_W(s1415), -64); STORE_PAIR(14, d01); \
-    d01 = Q6_W_vshuff_VVR(Q6_V_hi_W(s3031), Q6_V_hi_W(s1415), -64); STORE_PAIR(15, d01); \
-} while (0)
-
-static __attribute__((noinline)) void conv2d_pack_tile_f32_to_f16(
-        __fp16 * dst,
-        const float * src,
-        size_t channel_stride) {
-    CONV2D_PAIR_DECLS(d);
-#define LOAD_CHANNEL(c) hvx_vmemu(src + (size_t) (c) * channel_stride)
-    d01   = Q6_W_vshuff_VVR(LOAD_CHANNEL( 1), LOAD_CHANNEL( 0), -4);
-    d23   = Q6_W_vshuff_VVR(LOAD_CHANNEL( 3), LOAD_CHANNEL( 2), -4);
-    d45   = Q6_W_vshuff_VVR(LOAD_CHANNEL( 5), LOAD_CHANNEL( 4), -4);
-    d67   = Q6_W_vshuff_VVR(LOAD_CHANNEL( 7), LOAD_CHANNEL( 6), -4);
-    d89   = Q6_W_vshuff_VVR(LOAD_CHANNEL( 9), LOAD_CHANNEL( 8), -4);
-    d1011 = Q6_W_vshuff_VVR(LOAD_CHANNEL(11), LOAD_CHANNEL(10), -4);
-    d1213 = Q6_W_vshuff_VVR(LOAD_CHANNEL(13), LOAD_CHANNEL(12), -4);
-    d1415 = Q6_W_vshuff_VVR(LOAD_CHANNEL(15), LOAD_CHANNEL(14), -4);
-    d1617 = Q6_W_vshuff_VVR(LOAD_CHANNEL(17), LOAD_CHANNEL(16), -4);
-    d1819 = Q6_W_vshuff_VVR(LOAD_CHANNEL(19), LOAD_CHANNEL(18), -4);
-    d2021 = Q6_W_vshuff_VVR(LOAD_CHANNEL(21), LOAD_CHANNEL(20), -4);
-    d2223 = Q6_W_vshuff_VVR(LOAD_CHANNEL(23), LOAD_CHANNEL(22), -4);
-    d2425 = Q6_W_vshuff_VVR(LOAD_CHANNEL(25), LOAD_CHANNEL(24), -4);
-    d2627 = Q6_W_vshuff_VVR(LOAD_CHANNEL(27), LOAD_CHANNEL(26), -4);
-    d2829 = Q6_W_vshuff_VVR(LOAD_CHANNEL(29), LOAD_CHANNEL(28), -4);
-    d3031 = Q6_W_vshuff_VVR(LOAD_CHANNEL(31), LOAD_CHANNEL(30), -4);
-#undef LOAD_CHANNEL
-#define PACK_STORE_PAIR(i, p) \
-    ((HVX_Vector *) dst)[i] = hvx_vec_f32_to_f16_shuff(Q6_V_lo_W(p), Q6_V_hi_W(p))
-    CONV2D_TRANSPOSE_FINISH(PACK_STORE_PAIR);
-#undef PACK_STORE_PAIR
-}
-
-static __attribute__((noinline)) void conv2d_store_tile_f16_to_f32(
-        float * dst,
-        const __fp16 * src,
-        size_t channel_stride) {
-    CONV2D_PAIR_DECLS(d);
-    const HVX_Vector * tiles = (const HVX_Vector *) src;
-    HVX_VectorPair rows;
-#define LOAD_ROW_PAIR(i, dpair) do { \
-    rows = hvx_vec_f16_to_f32_shuff(tiles[i]); \
-    dpair = Q6_W_vshuff_VVR(Q6_V_hi_W(rows), Q6_V_lo_W(rows), -4); \
-} while (0)
-    LOAD_ROW_PAIR( 0, d01);
-    LOAD_ROW_PAIR( 1, d23);
-    LOAD_ROW_PAIR( 2, d45);
-    LOAD_ROW_PAIR( 3, d67);
-    LOAD_ROW_PAIR( 4, d89);
-    LOAD_ROW_PAIR( 5, d1011);
-    LOAD_ROW_PAIR( 6, d1213);
-    LOAD_ROW_PAIR( 7, d1415);
-    LOAD_ROW_PAIR( 8, d1617);
-    LOAD_ROW_PAIR( 9, d1819);
-    LOAD_ROW_PAIR(10, d2021);
-    LOAD_ROW_PAIR(11, d2223);
-    LOAD_ROW_PAIR(12, d2425);
-    LOAD_ROW_PAIR(13, d2627);
-    LOAD_ROW_PAIR(14, d2829);
-    LOAD_ROW_PAIR(15, d3031);
-#undef LOAD_ROW_PAIR
-#define OUTPUT_STORE_PAIR(i, p) do { \
-    hvx_vmem(dst + (size_t) (2 * (i) + 0) * channel_stride) = Q6_V_lo_W(p); \
-    hvx_vmem(dst + (size_t) (2 * (i) + 1) * channel_stride) = Q6_V_hi_W(p); \
-} while (0)
-    CONV2D_TRANSPOSE_FINISH(OUTPUT_STORE_PAIR);
-#undef OUTPUT_STORE_PAIR
-}
 
 struct conv2d_prepare_state {
     struct htp_context * ctx;
@@ -210,55 +55,8 @@ struct conv2d_prepare_state {
     bool wait_weight_dma;
     bool upscale2;
     bool direct_upscale2;
-    bool input_silu;
     bool input_f16;
 };
-
-static inline HVX_Vector conv2d_silu(HVX_Vector x) {
-    const HVX_Vector sigmoid = hvx_vec_fast_sigmoid_f32_guard(
-        x, hvx_vec_splat_f32(1.0f), hvx_vec_splat_f32(87.0f),
-        hvx_vec_splat_f32(-87.0f));
-    return Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(x, sigmoid));
-}
-
-static void conv2d_silu_inplace(float * data, uint32_t n) {
-    HVX_Vector * vectors = (HVX_Vector *) data;
-    const uint32_t nvec = n / 32u;
-    uint32_t i = 0;
-    for (; i + 3u < nvec; i += 4u) {
-        const HVX_Vector x0 = vectors[i + 0u];
-        const HVX_Vector x1 = vectors[i + 1u];
-        const HVX_Vector x2 = vectors[i + 2u];
-        const HVX_Vector x3 = vectors[i + 3u];
-        vectors[i + 0u] = conv2d_silu(x0);
-        vectors[i + 1u] = conv2d_silu(x1);
-        vectors[i + 2u] = conv2d_silu(x2);
-        vectors[i + 3u] = conv2d_silu(x3);
-    }
-    for (; i < nvec; ++i) {
-        vectors[i] = conv2d_silu(vectors[i]);
-    }
-    const uint32_t tail = n % 32u;
-    if (tail) {
-        hvx_vec_store_a(vectors + nvec, tail * sizeof(float),
-                        conv2d_silu(vectors[nvec]));
-    }
-}
-
-static void conv2d_silu_f16_inplace(__fp16 * data, uint32_t n) {
-    HVX_Vector * vectors = (HVX_Vector *) data;
-    const uint32_t nvec = n / 64u;
-    for (uint32_t i = 0; i < nvec; ++i) {
-        const HVX_Vector x = vectors[i];
-        vectors[i] = hvx_vec_mul_f16_f16(x, hvx_vec_fast_sigmoid_f16(x));
-    }
-    const uint32_t tail = n % 64u;
-    if (tail) {
-        const HVX_Vector x = vectors[nvec];
-        hvx_vec_store_a(vectors + nvec, tail * sizeof(__fp16),
-                        hvx_vec_mul_f16_f16(x, hvx_vec_fast_sigmoid_f16(x)));
-    }
-}
 
 static inline HVX_Vector conv2d_join_f16_halves(HVX_Vector lo, HVX_Vector hi) {
     const HVX_VectorPred lower_half = Q6_Q_vsetq_R(64);
@@ -403,9 +201,6 @@ static void conv2d_pack_activation_group_f16(
     const uint32_t icb = channel_first / 32u;
     const uint32_t cp_first = (channel_first % 32u) / 2u;
     const uint32_t n_pairs = st->group_channels / 2u;
-    if (st->input_silu) {
-        conv2d_silu_f16_inplace(x, st->group_channels * channel_elms);
-    }
     if (st->kw == 3) {
         for (uint32_t cp = 0; cp < n_pairs; ++cp) {
             for (uint32_t sy = 0; sy < st->halo_h; ++sy) {
@@ -487,14 +282,6 @@ static void conv2d_prepare_upscale_group_direct(
                     Q6_V_lo_W(dup0), Q6_V_hi_W(dup0), x_parity + 2u);
                 HVX_Vector x21 = conv2d_upscale2_shift(
                     Q6_V_lo_W(dup1), Q6_V_hi_W(dup1), x_parity + 2u);
-                if (st->input_silu) {
-                    x00 = conv2d_silu(x00);
-                    x01 = conv2d_silu(x01);
-                    x10 = conv2d_silu(x10);
-                    x11 = conv2d_silu(x11);
-                    x20 = conv2d_silu(x20);
-                    x21 = conv2d_silu(x21);
-                }
                 conv2d_store_activation_triplet(
                     st, sy * st->x_tiles + tx, icb, cp_first + cp,
                     hvx_vec_f32_to_f16_shuff(x00, x01),
@@ -548,14 +335,6 @@ static void conv2d_prepare_upscale_group_direct_f16(
                     Q6_V_lo_W(dup0), Q6_V_hi_W(dup0), x_parity + 2u);
                 HVX_Vector x21 = conv2d_upscale2_shift_f16(
                     Q6_V_lo_W(dup1), Q6_V_hi_W(dup1), x_parity + 2u);
-                if (st->input_silu) {
-                    x00 = hvx_vec_mul_f16_f16(x00, hvx_vec_fast_sigmoid_f16(x00));
-                    x01 = hvx_vec_mul_f16_f16(x01, hvx_vec_fast_sigmoid_f16(x01));
-                    x10 = hvx_vec_mul_f16_f16(x10, hvx_vec_fast_sigmoid_f16(x10));
-                    x11 = hvx_vec_mul_f16_f16(x11, hvx_vec_fast_sigmoid_f16(x11));
-                    x20 = hvx_vec_mul_f16_f16(x20, hvx_vec_fast_sigmoid_f16(x20));
-                    x21 = hvx_vec_mul_f16_f16(x21, hvx_vec_fast_sigmoid_f16(x21));
-                }
                 conv2d_store_activation_triplet(
                     st, sy * st->x_tiles + tx, icb, cp_first + cp,
                     conv2d_pack_f16_pair(x00, x01),
@@ -621,9 +400,6 @@ static void conv2d_prepare_activation_worker(unsigned int nth, unsigned int ith,
             const uint32_t cp_first = (channel_first % 32) / 2;
             const uint32_t n_pairs = st->group_channels / 2;
             float * x = (float *) x_ptr;
-            if (st->input_silu) {
-                conv2d_silu_inplace(x, st->group_channels * channel_elms);
-            }
             if (st->kw == 3) {
             for (uint32_t cp = 0; cp < n_pairs; ++cp) {
                 for (uint32_t sy = 0; sy < st->halo_h; ++sy) {
@@ -739,18 +515,6 @@ static void conv2d_store_output_f16_worker(unsigned int nth, unsigned int ith, v
                             (st->c + ((size_t) nt * st->m_tiles + mt) *
                              HTP_MM_HMX_TILE_N_ELMS);
                         HVX_Vector output = hvx_vec_add_f16_f16(tile[rp], packed_bias);
-                        __fp16 * dst0 = (__fp16 *) st->dst +
-                            ((size_t) channel * st->oh + st->y0 + oy) * st->ow +
-                            st->x0 + (tx + j) * HTP_CONV2D_TILE_W;
-                        if (st->flags & HTP_CONV2D_RESIDUAL) {
-                            const __fp16 * residual0 = (const __fp16 *) st->residual +
-                                (dst0 - (__fp16 *) st->dst);
-                            const __fp16 * residual1 = residual0 + (size_t) st->oh * st->ow;
-                            const HVX_Vector packed_residual = Q6_Vh_vshuff_Vh(
-                                conv2d_join_f16_halves(
-                                    hvx_vmemu(residual0), hvx_vmemu(residual1)));
-                            output = hvx_vec_add_f16_f16(output, packed_residual);
-                        }
                         planar[j] = Q6_Vh_vdeal_Vh(output);
                     }
                     __fp16 * dst0 = (__fp16 *) st->dst +
@@ -1023,7 +787,6 @@ static void conv2d_init_prepare_state(
                                (tile_w / HTP_CONV2D_TILE_W - 1u) *
                                (HTP_CONV2D_TILE_W / 2u) +
                                (src->type == HTP_TYPE_F16 ? 64u : 32u) <= src->ne[0],
-        .input_silu = (kp->flags & HTP_CONV2D_INPUT_SILU) != 0,
         .input_f16 = src->type == HTP_TYPE_F16,
     };
 }
@@ -1121,17 +884,13 @@ int op_conv2d(struct htp_ops_context * octx) {
     }
 
     const uint32_t kh = weight->ne[1];
-    const uint32_t kw = weight->ne[0];
     const uint32_t ic = weight->ne[2];
     const uint32_t oc = weight->ne[3];
     const uint32_t ow = dst->ne[0];
     const uint32_t oh = dst->ne[1];
     uint8_t * base = (uint8_t *) octx->ctx->vtcm_base;
     __fp16 * b = VTCM_LAYOUT_PTR(__fp16, base, kp->off_weight);
-    float * xbuf[2] = {
-        VTCM_LAYOUT_PTR(float, base, kp->off_x[0]),
-        VTCM_LAYOUT_PTR(float, base, kp->off_x[1]),
-    };
+    float * xbuf = VTCM_LAYOUT_PTR(float, base, kp->off_x);
     __fp16 * abuf[2] = {
         VTCM_LAYOUT_PTR(__fp16, base, kp->off_a[0]),
         VTCM_LAYOUT_PTR(__fp16, base, kp->off_a[1]),
@@ -1166,7 +925,7 @@ int op_conv2d(struct htp_ops_context * octx) {
     const uint32_t first_tile_h = hex_smin(kp->tile_h, oh);
     const uint32_t first_m_tiles = (first_tile_w / HTP_CONV2D_TILE_W) * first_tile_h;
     htp_trace_event_start(&octx->ctx->trace[0], HTP_TRACE_EVT_HVX_A_PREP, 0);
-    conv2d_prepare_activation(octx, xbuf[0], abuf[0], 0, 0,
+    conv2d_prepare_activation(octx, xbuf, abuf[0], 0, 0,
                               first_tile_w, first_tile_h, true, kp);
     htp_trace_event_stop(&octx->ctx->trace[0], HTP_TRACE_EVT_HVX_A_PREP, 0);
 
@@ -1222,7 +981,7 @@ int op_conv2d(struct htp_ops_context * octx) {
                 (next_tile_w / HTP_CONV2D_TILE_W) * next_tile_h;
 
             htp_trace_event_start(&octx->ctx->trace[0], HTP_TRACE_EVT_HVX_A_PREP, next);
-            conv2d_init_prepare_state(octx, xbuf[next_slot], abuf[next_slot],
+            conv2d_init_prepare_state(octx, xbuf, abuf[next_slot],
                                       next_x0, next_y0, next_tile_w, next_tile_h,
                                       false, kp, &pipeline.prepare);
             jobs[next_slot] = (struct conv2d_hmx_job) {

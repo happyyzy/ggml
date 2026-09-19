@@ -165,6 +165,9 @@ static inline __attribute__((always_inline)) void group_norm_transform_f32(const
     float * dst = (float *) dst_data;
     const bool affine = (st->flags & HTP_GROUP_NORM_AFFINE) != 0;
     const bool silu = (st->flags & HTP_GROUP_NORM_SILU) != 0;
+    const HVX_Vector one = hvx_vec_splat_f32(1.0f);
+    const HVX_Vector max_exp = hvx_vec_splat_f32(87.0f);
+    const HVX_Vector min_exp = hvx_vec_splat_f32(-87.0f);
     uint32_t done = 0;
 
     while (done < n) {
@@ -182,16 +185,14 @@ static inline __attribute__((always_inline)) void group_norm_transform_f32(const
 
 #pragma unroll(4)
         for (uint32_t i = 0; i < nvec; ++i) {
-            output[i] = hvx_vec_add_f32_f32(hvx_vec_mul_f32_f32(input[i], scale), offset_vec);
+            HVX_Vector y = hvx_vec_add_f32_f32(hvx_vec_mul_f32_f32(input[i], scale), offset_vec);
+            if (silu) {
+                const HVX_Vector sigmoid = hvx_vec_fast_sigmoid_f32_guard(y, one, max_exp, min_exp);
+                y = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(y, sigmoid));
+            }
+            output[i] = y;
         }
         done += count;
-    }
-
-    if (silu) {
-        for (uint32_t i = 0; i < n; i += st->width) {
-            hvx_sigmoid_f32_aa((uint8_t *) (dst + i), (const uint8_t *) (dst + i), st->width);
-            hvx_mul_f32_aaa((uint8_t *) (dst + i), (const uint8_t *) (src + i), (const uint8_t *) (dst + i), st->width);
-        }
     }
 }
 
@@ -354,7 +355,7 @@ int op_group_norm(struct htp_ops_context * octx) {
     float epsilon;
     __builtin_memcpy(&epsilon, &octx->op_params[1], sizeof(epsilon));
 
-    if (!src || !dst || (!f16 && (params->flags & HTP_GROUP_NORM_SILU)) ||
+    if (!src || !dst ||
         !((src->type == HTP_TYPE_F32 && dst->type == HTP_TYPE_F32) || (f16 && dst->type == HTP_TYPE_F16)) ||
         groups == 0 || src->ne[2] % groups != 0 || (!f16 && (src->ne[0] * src->ne[1]) % 32u != 0) ||
         src->ne[0] != dst->ne[0] || src->ne[1] != dst->ne[1] ||
