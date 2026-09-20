@@ -620,7 +620,8 @@ static void conv2d_store_output_worker(unsigned int nth, unsigned int ith, void 
                         row0 = hvx_vec_add_f32_f32(
                             row0, hvx_vmemu(st->residual + (dst - st->dst)));
                     }
-                    if (valid_count == HTP_CONV2D_TILE_W) {
+                    if (valid_count == HTP_CONV2D_TILE_W &&
+                        ((uintptr_t) dst & 127u) == 0) {
                         Q6_vmem_QRIV_nt(all, (HVX_Vector *) dst, row0);
                     } else {
                         hvx_vec_store_u(dst, valid_count * sizeof(float), row0);
@@ -632,7 +633,8 @@ static void conv2d_store_output_worker(unsigned int nth, unsigned int ith, void 
                             row1 = hvx_vec_add_f32_f32(
                                 row1, hvx_vmemu(st->residual + (dst1 - st->dst)));
                         }
-                        if (valid_count == HTP_CONV2D_TILE_W) {
+                        if (valid_count == HTP_CONV2D_TILE_W &&
+                            ((uintptr_t) dst1 & 127u) == 0) {
                             Q6_vmem_QRIV_nt(all, (HVX_Vector *) dst1, row1);
                         } else {
                             hvx_vec_store_u(dst1, valid_count * sizeof(float), row1);
