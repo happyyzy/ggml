@@ -3720,8 +3720,12 @@ int op_matmul_segmented(struct htp_ops_context * octx) {
     const struct htp_tensor * dst = octx->dst;
     const struct htp_mm_kernel_params * kparams = (const struct htp_mm_kernel_params *) octx->kernel_params;
 
-    if (!weight || !src0 || !src1 || !dst || !kparams->n_hmx ||
-        weight->type != HTP_TYPE_F8_E4M3 || src0->type != HTP_TYPE_F32 ||
+    const bool supported_weight = weight &&
+        (weight->type == HTP_TYPE_F8_E4M3 ||
+         weight->type == HTP_TYPE_Q4_0 ||
+         weight->type == HTP_TYPE_MXFP4);
+    if (!supported_weight || !src0 || !src1 || !dst || !kparams->n_hmx ||
+        src0->type != HTP_TYPE_F32 ||
         src1->type != HTP_TYPE_F32 || dst->type != HTP_TYPE_F32) {
         return HTP_STATUS_INVAL_PARAMS;
     }
@@ -3732,7 +3736,7 @@ int op_matmul_segmented(struct htp_ops_context * octx) {
         return HTP_STATUS_INVAL_PARAMS;
     }
 
-    float output_scale = 256.0f;
+    float output_scale = weight->type == HTP_TYPE_F8_E4M3 ? 256.0f : 1.0f;
     const int scale_status = hmx_mm_apply_output_scales(octx, kparams, 3, &output_scale);
     if (scale_status != HTP_STATUS_OK) {
         return scale_status;

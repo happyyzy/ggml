@@ -5001,9 +5001,14 @@ static bool ggml_hexagon_supported_mul_mat_segmented(const struct ggml_hexagon_s
     const struct ggml_tensor * src1 = dst->src[1];
     const struct ggml_tensor * src2 = dst->src[2];
 
-    if (!src0 || !src1 || !src2 || src0->type != GGML_TYPE_F8_E4M3 ||
+    const bool supported_weight = src0 &&
+        (src0->type == GGML_TYPE_F8_E4M3 ||
+         src0->type == GGML_TYPE_Q4_0 ||
+         src0->type == GGML_TYPE_MXFP4);
+    if (!supported_weight || !src1 || !src2 ||
         src1->type != GGML_TYPE_F32 || src2->type != GGML_TYPE_F32 ||
-        dst->type != GGML_TYPE_F32 || opt_arch < 79) {
+        dst->type != GGML_TYPE_F32 ||
+        (src0->type == GGML_TYPE_F8_E4M3 && opt_arch < 79)) {
         return false;
     }
     if (src0->ne[0] != src1->ne[0] + src2->ne[0] || src0->ne[1] != dst->ne[0] ||
