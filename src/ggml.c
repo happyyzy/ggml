@@ -5168,6 +5168,25 @@ struct ggml_tensor * ggml_conv_2d_direct_upscale(
     return result;
 }
 
+struct ggml_tensor * ggml_conv_2d_direct_upscale_add(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * bias,
+        struct ggml_tensor  * residual,
+        int                   residual_factor_t,
+        int                   upscale_factor,
+        int                   s0, int s1, int p0, int p1, int d0, int d1) {
+    GGML_ASSERT(residual != NULL);
+    GGML_ASSERT(residual_factor_t == 1 || residual_factor_t == 2);
+
+    struct ggml_tensor * result = ggml_conv_2d_direct_upscale(
+        ctx, a, b, bias, upscale_factor, s0, s1, p0, p1, d0, d1);
+    result->src[3] = residual;
+    ggml_set_op_params_i32(result, 7, residual_factor_t);
+    return result;
+}
+
 // ggml_conv_3d_direct
 
 struct ggml_tensor * ggml_conv_3d_direct(

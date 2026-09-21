@@ -365,9 +365,20 @@ static inline void cpy_dma_sametype_sameshape(
     dma_queue * q = octx->ctx->dma[0];
 
     if (contiguous_outer) {
-        if (!dma_queue_push(q, dma_make_ptr((void *) dst->data, (const void *) src0->data), nb1, nb01, ne00 * elem_size, ne01 * ne02 * ne03)) {
-            dma_queue_flush(q);
-            dma_queue_push(q, dma_make_ptr((void *) dst->data, (const void *) src0->data), nb1, nb01, ne00 * elem_size, ne01 * ne02 * ne03);
+        uint8_t * dst_ptr = (uint8_t *) dst->data;
+        const uint8_t * src_ptr = (const uint8_t *) src0->data;
+        uint32_t rows = ne01 * ne02 * ne03;
+        while (rows > 0) {
+            const uint32_t chunk = hex_smin(rows, 65535u);
+            if (!dma_queue_push(q, dma_make_ptr(dst_ptr, src_ptr),
+                                nb1, nb01, ne00 * elem_size, chunk)) {
+                dma_queue_flush(q);
+                dma_queue_push(q, dma_make_ptr(dst_ptr, src_ptr),
+                               nb1, nb01, ne00 * elem_size, chunk);
+            }
+            dst_ptr += (size_t) chunk * nb1;
+            src_ptr += (size_t) chunk * nb01;
+            rows -= chunk;
         }
         dma_queue_flush(q);
         return;

@@ -2326,6 +2326,21 @@ extern "C" {
             int                   d0,
             int                   d1);
 
+    GGML_API struct ggml_tensor * ggml_conv_2d_direct_upscale_add(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * bias,
+            struct ggml_tensor  * residual,
+            int                   residual_factor_t,
+            int                   upscale_factor,
+            int                   s0,
+            int                   s1,
+            int                   p0,
+            int                   p1,
+            int                   d0,
+            int                   d1);
+
     GGML_API struct ggml_tensor * ggml_conv_3d_direct(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,   // kernel [KW, KH, KD, IC * OC]

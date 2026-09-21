@@ -249,6 +249,7 @@ enum ggml_hexagon_tensor_flags {
     GGML_HEXAGON_TENSOR_WEIGHT    = (1 << 1),
     GGML_HEXAGON_TENSOR_FENCE     = (1 << 2),
     GGML_HEXAGON_TENSOR_FUSEABLE  = (1 << 3),
+    GGML_HEXAGON_TENSOR_CONV2D    = (1 << 4),
 };
 
 static inline bool ggml_hexagon_is_repack_type(enum ggml_type type) {
@@ -365,6 +366,8 @@ struct ggml_hexagon_tensor_extra {
     std::vector<uint8_t> shadow_buf;
     size_t               shadow_size { 0 };
     uint32_t             flags { 0 };
+    uint32_t             conv_ic { 0 };
+    uint32_t             conv_oc { 0 };
 };
 
 static inline bool ggml_hexagon_tensor_is_fuseable(const struct ggml_tensor * t) {
@@ -449,6 +452,7 @@ struct ggml_hexagon_session {
     std::vector<htp_opnode> cached_nodes;
 
     mutable std::unordered_set<const ggml_tensor *> needs_repack;
+    mutable std::unordered_map<const ggml_tensor *, std::pair<uint32_t, uint32_t>> conv2d_weights;
 
     ggml_hexagon_mdev_group                mdev;
     ggml_backend_dev_t                     dev       = nullptr;
@@ -733,6 +737,13 @@ static enum ggml_status ggml_backend_hexagon_buffer_init_tensor(ggml_backend_buf
     sbuf->tensor_extra.push_back(extra);
 
     tensor->extra = extra;
+    auto conv = sess->conv2d_weights.find(tensor);
+    if (conv != sess->conv2d_weights.end()) {
+        extra->flags |= GGML_HEXAGON_TENSOR_CONV2D;
+        extra->conv_ic = conv->second.first;
+        extra->conv_oc = conv->second.second;
+        sess->conv2d_weights.erase(conv);
+    }
     if (ggml_hexagon_is_repack_type(tensor->type)) {
         if (sess->needs_repack.count(tensor)) {
             extra->flags |= GGML_HEXAGON_TENSOR_REPACK;
@@ -1399,20 +1410,16 @@ static bool ggml_hexagon_is_conv2d_hmx_weight(const ggml_tensor * tensor) {
            tensor->ne[2] % 32 == 0;
 }
 
-static void repack_conv2d_f16_hmx(ggml_tensor * tensor, const void * data, size_t size) {
-    GGML_ASSERT(tensor->type == GGML_TYPE_F16);
-    GGML_ASSERT(size == ggml_nbytes(tensor));
-
-    const uint32_t kw = (uint32_t) tensor->ne[0];
-    const uint32_t kh = (uint32_t) tensor->ne[1];
-    const uint32_t ic = (uint32_t) tensor->ne[2];
-    const uint32_t oc = (uint32_t) tensor->ne[3];
-    const uint32_t ic_blocks = ic / 32;
+static void repack_conv2d_f16_hmx_data(
+        void * dst_data, const void * data,
+        uint32_t kw, uint32_t kh, uint32_t ic, uint32_t oc) {
+    const uint32_t ic_padded = hex_round_up(ic, 32);
+    const uint32_t ic_blocks = ic_padded / 32;
     const uint32_t k_tiles = kh * kw * ic_blocks;
     const uint32_t oc_padded = hex_round_up(oc, 32);
     const ggml_fp16_t * src = (const ggml_fp16_t *) data;
-    ggml_fp16_t * dst = (ggml_fp16_t *) tensor->data;
-    memset(dst, 0, (size_t) kh * kw * ic * oc_padded * sizeof(*dst));
+    ggml_fp16_t * dst = (ggml_fp16_t *) dst_data;
+    memset(dst, 0, (size_t) kh * kw * ic_padded * oc_padded * sizeof(*dst));
 
     for (uint32_t o = 0; o < oc; ++o) {
         const uint32_t nt = o / 32;
@@ -1432,17 +1439,20 @@ static void repack_conv2d_f16_hmx(ggml_tensor * tensor, const void * data, size_
     }
 }
 
-static void unpack_conv2d_f16_hmx(void * data, const ggml_tensor * tensor, size_t size) {
+static void repack_conv2d_f16_hmx(ggml_tensor * tensor, const void * data, size_t size) {
     GGML_ASSERT(tensor->type == GGML_TYPE_F16);
     GGML_ASSERT(size == ggml_nbytes(tensor));
+    repack_conv2d_f16_hmx_data(tensor->data, data,
+        (uint32_t) tensor->ne[0], (uint32_t) tensor->ne[1],
+        (uint32_t) tensor->ne[2], (uint32_t) tensor->ne[3]);
+}
 
-    const uint32_t kw = (uint32_t) tensor->ne[0];
-    const uint32_t kh = (uint32_t) tensor->ne[1];
-    const uint32_t ic = (uint32_t) tensor->ne[2];
-    const uint32_t oc = (uint32_t) tensor->ne[3];
-    const uint32_t ic_blocks = ic / 32;
+static void unpack_conv2d_f16_hmx_data(
+        void * data, const void * src_data,
+        uint32_t kw, uint32_t kh, uint32_t ic, uint32_t oc) {
+    const uint32_t ic_blocks = hex_round_up(ic, 32) / 32;
     const uint32_t k_tiles = kh * kw * ic_blocks;
-    const ggml_fp16_t * src = (const ggml_fp16_t *) tensor->data;
+    const ggml_fp16_t * src = (const ggml_fp16_t *) src_data;
     ggml_fp16_t * dst = (ggml_fp16_t *) data;
 
     for (uint32_t o = 0; o < oc; ++o) {
@@ -1461,6 +1471,14 @@ static void unpack_conv2d_f16_hmx(void * data, const ggml_tensor * tensor, size_
             }
         }
     }
+}
+
+static void unpack_conv2d_f16_hmx(void * data, const ggml_tensor * tensor, size_t size) {
+    GGML_ASSERT(tensor->type == GGML_TYPE_F16);
+    GGML_ASSERT(size == ggml_nbytes(tensor));
+    unpack_conv2d_f16_hmx_data(data, tensor->data,
+        (uint32_t) tensor->ne[0], (uint32_t) tensor->ne[1],
+        (uint32_t) tensor->ne[2], (uint32_t) tensor->ne[3]);
 }
 
 static void convert_bf16_weights_to_f16(void * dst, const void * src, size_t size) {
@@ -1532,6 +1550,17 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
         sess->c_name(), tensor->name, data, offset, size, (int) buffer->usage, extra->flags);
 
     if (ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+        (extra->flags & GGML_HEXAGON_TENSOR_CONV2D)) {
+        GGML_ASSERT(tensor->type == GGML_TYPE_F16 && tensor->ne[2] == 1 &&
+                    tensor->ne[3] == (int64_t) extra->conv_ic * extra->conv_oc);
+        GGML_ASSERT(offset == 0 && size == ggml_nbytes(tensor));
+        repack_conv2d_f16_hmx_data(tensor->data, data,
+            (uint32_t) tensor->ne[0], (uint32_t) tensor->ne[1],
+            extra->conv_ic, extra->conv_oc);
+        return;
+    }
+
+    if (ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
         ggml_hexagon_is_conv2d_hmx_weight(tensor)) {
         GGML_ASSERT(offset == 0 && size == ggml_nbytes(tensor));
         repack_conv2d_f16_hmx(tensor, data, size);
@@ -1580,6 +1609,17 @@ static void ggml_backend_hexagon_buffer_get_tensor(ggml_backend_buffer_t buffer,
 
     HEX_VERBOSE("ggml-hex: %s get-tensor %s : data %p offset %zu size %zu usage %d flags 0x%x\n",
             sess->c_name(), tensor->name, data, offset, size, (int) buffer->usage, extra->flags);
+
+    if (ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+        (extra->flags & GGML_HEXAGON_TENSOR_CONV2D)) {
+        GGML_ASSERT(tensor->type == GGML_TYPE_F16 && tensor->ne[2] == 1 &&
+                    tensor->ne[3] == (int64_t) extra->conv_ic * extra->conv_oc);
+        GGML_ASSERT(offset == 0 && size == ggml_nbytes(tensor));
+        unpack_conv2d_f16_hmx_data(data, tensor->data,
+            (uint32_t) tensor->ne[0], (uint32_t) tensor->ne[1],
+            extra->conv_ic, extra->conv_oc);
+        return;
+    }
 
     if (ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
         ggml_hexagon_is_conv2d_hmx_weight(tensor)) {
@@ -1855,6 +1895,27 @@ static size_t ggml_backend_hexagon_buffer_type_get_alignment(ggml_backend_buffer
 }
 
 static size_t ggml_backend_hexagon_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * t) {
+    auto * context = static_cast<ggml_backend_hexagon_buffer_type_context *>(buft->context);
+    auto * sess = context->dev_ctx->session();
+    uint32_t conv_ic = 0;
+    uint32_t conv_oc = 0;
+    if (t->extra) {
+        const auto * extra = static_cast<const ggml_hexagon_tensor_extra *>(t->extra);
+        if (extra->flags & GGML_HEXAGON_TENSOR_CONV2D) {
+            conv_ic = extra->conv_ic;
+            conv_oc = extra->conv_oc;
+        }
+    } else {
+        const auto conv = sess->conv2d_weights.find(t);
+        if (conv != sess->conv2d_weights.end()) {
+            conv_ic = conv->second.first;
+            conv_oc = conv->second.second;
+        }
+    }
+    if (conv_ic != 0 && conv_oc != 0) {
+        return (size_t) t->ne[0] * t->ne[1] * hex_round_up(conv_ic, 32) *
+               hex_round_up(conv_oc, 32) * sizeof(ggml_fp16_t);
+    }
     if (ggml_hexagon_is_conv2d_hmx_weight(t)) {
         return (size_t) t->ne[0] * t->ne[1] * t->ne[2] * hex_round_up(t->ne[3], 32) * sizeof(ggml_fp16_t);
     }
@@ -2019,6 +2080,7 @@ struct ggml_hexagon_opbatch {
 
         int64_t ne0 = t->ne[0];
         int64_t ne1 = t->ne[1];
+        const bool is_conv2d = (extra->flags & GGML_HEXAGON_TENSOR_CONV2D) != 0;
         const bool is_repack = (extra->flags & GGML_HEXAGON_TENSOR_REPACK) != 0;
         if (is_repack) {
             ne0 = hex_round_up(ne0, 32);
@@ -2032,7 +2094,8 @@ struct ggml_hexagon_opbatch {
             ? ggml_hexagon_hmx_weight_storage_type(t->type) : t->type;
         return (h->type == storage_type) &&
                (h->ne[0] == ne0) && (h->ne[1] == ne1) && (h->ne[2] == t->ne[2]) && (h->ne[3] == t->ne[3]) &&
-               (h->nb[0] == t->nb[0]) && (h->nb[1] == nb1) && (h->nb[2] == nb2) && (h->nb[3] == nb3);
+               (h->nb[0] == t->nb[0]) && (h->nb[1] == nb1) && (h->nb[2] == nb2) && (h->nb[3] == nb3) &&
+               (((h->flags & HTP_TENSOR_CONV2D) != 0) == is_conv2d);
     }
 
     // add tensor and return its index
@@ -2068,8 +2131,15 @@ struct ggml_hexagon_opbatch {
         h.type  = (extra->flags & GGML_HEXAGON_TENSOR_WEIGHT) != 0
             ? ggml_hexagon_hmx_weight_storage_type(t->type) : t->type;
 
+        const bool is_conv2d = (extra->flags & GGML_HEXAGON_TENSOR_CONV2D) != 0;
         const bool is_repack = (extra->flags & GGML_HEXAGON_TENSOR_REPACK) != 0;
-        if (is_repack) {
+        if (is_conv2d) {
+            h.size  = (size_t) t->ne[0] * t->ne[1] * hex_round_up(extra->conv_ic, 32) *
+                      hex_round_up(extra->conv_oc, 32) * sizeof(ggml_fp16_t);
+            h.ne[0] = t->ne[0]; h.ne[1] = t->ne[1]; h.ne[2] = t->ne[2]; h.ne[3] = t->ne[3];
+            h.nb[0] = t->nb[0]; h.nb[1] = t->nb[1]; h.nb[2] = t->nb[2]; h.nb[3] = t->nb[3];
+            t_size = h.size;
+        } else if (is_repack) {
             h.ne[0] = hex_round_up(t->ne[0], 32);
             h.ne[1] = hex_round_up(t->ne[1], 32);
             h.ne[2] = t->ne[2];
@@ -2096,6 +2166,9 @@ struct ggml_hexagon_opbatch {
         }
         if ((extra->flags & GGML_HEXAGON_TENSOR_FENCE) != 0) {
             h.flags |= HTP_TENSOR_FENCE;
+        }
+        if (is_conv2d) {
+            h.flags |= HTP_TENSOR_CONV2D;
         }
 
         HEX_VERBOSE("ggml-hex: %s add-tensor #%u %s : bi %d data %p offset %zu size %zu flags 0x%x : %zu:%zu:%zu:%zu\n", sess->c_name(),
@@ -2604,7 +2677,8 @@ struct ggml_hexagon_opbatch {
 
         auto * params = (struct htp_conv2d_kernel_params *) last_node.kernel_params;
         if ((params->flags & HTP_CONV2D_BIAS) == 0 ||
-            (params->flags & HTP_CONV2D_RESIDUAL) != 0 || conv_out->type != GGML_TYPE_F32 ||
+            (params->flags & (HTP_CONV2D_RESIDUAL | HTP_CONV2D_DUP_UP_RESIDUAL)) != 0 ||
+            conv_out->type != GGML_TYPE_F32 ||
             extra->type != conv_out->type || !ggml_are_same_shape(extra, conv_out) ||
             !ggml_is_contiguous(extra) || last_node.inputs[1]->data == node.dst()->data) {
             return false;
@@ -5589,8 +5663,10 @@ static bool ggml_hexagon_precompute_conv2d_params(
         (ow + HTP_CONV2D_TILE_W - 1u) & ~(HTP_CONV2D_TILE_W - 1u);
 
     auto build_layout = [&](struct htp_conv2d_kernel_params * result,
+                            uint32_t n_tiles_per_block,
                             uint32_t tile_w, uint32_t tile_h) {
-        htp_conv2d_layout_build(result, kh, kw, ic_padded, oc, tile_w, tile_h,
+        htp_conv2d_layout_build(result, kh, kw, ic_padded, oc,
+                                n_tiles_per_block, tile_w, tile_h,
                                 sess->n_threads, input_element_size);
         result->kd = kd;
         result->ic = ic;
@@ -5601,9 +5677,10 @@ static bool ggml_hexagon_precompute_conv2d_params(
         return result->vtcm_size;
     };
 
-    auto max_tile_rows = [&](uint32_t tile_w, struct htp_conv2d_kernel_params * result) {
+    auto max_tile_rows = [&](uint32_t n_tiles_per_block, uint32_t tile_w,
+                             struct htp_conv2d_kernel_params * result) {
         struct htp_conv2d_kernel_params candidate;
-        if (build_layout(&candidate, tile_w, 1) > sess->vtcm_size) {
+        if (build_layout(&candidate, n_tiles_per_block, tile_w, 1) > sess->vtcm_size) {
             return 0u;
         }
 
@@ -5611,49 +5688,78 @@ static bool ggml_hexagon_precompute_conv2d_params(
         uint32_t hi = oh;
         while (lo < hi) {
             const uint32_t mid = lo + (hi - lo + 1) / 2;
-            if (build_layout(&candidate, tile_w, mid) <= sess->vtcm_size) {
+            if (build_layout(&candidate, n_tiles_per_block, tile_w, mid) <= sess->vtcm_size) {
                 lo = mid;
             } else {
                 hi = mid - 1;
             }
         }
-        build_layout(result, tile_w, lo);
+        build_layout(result, n_tiles_per_block, tile_w, lo);
         return lo;
     };
 
-    uint32_t max_m_tiles = 0;
-    for (uint32_t tile_w = HTP_CONV2D_TILE_W; tile_w <= padded_ow; tile_w += HTP_CONV2D_TILE_W) {
-        struct htp_conv2d_kernel_params candidate;
-        const uint32_t rows = max_tile_rows(tile_w, &candidate);
-        max_m_tiles = std::max(max_m_tiles, rows * (tile_w / HTP_CONV2D_TILE_W));
-    }
-    if (max_m_tiles == 0) {
-        memset(kparams, 0, sizeof(*kparams));
-        return false;
-    }
+    auto select_layout = [&](uint32_t n_tiles_per_block,
+                             struct htp_conv2d_kernel_params * result) {
+        uint32_t max_m_tiles = 0;
+        for (uint32_t tile_w = HTP_CONV2D_TILE_W; tile_w <= padded_ow; tile_w += HTP_CONV2D_TILE_W) {
+            struct htp_conv2d_kernel_params candidate;
+            const uint32_t rows = max_tile_rows(n_tiles_per_block, tile_w, &candidate);
+            max_m_tiles = std::max(max_m_tiles, rows * (tile_w / HTP_CONV2D_TILE_W));
+        }
+        if (max_m_tiles == 0) {
+            return false;
+        }
 
-    bool found = false;
-    for (uint32_t tile_w = HTP_CONV2D_TILE_W; tile_w <= padded_ow; tile_w += HTP_CONV2D_TILE_W) {
-        struct htp_conv2d_kernel_params candidate;
-        const uint32_t rows = max_tile_rows(tile_w, &candidate);
-        const uint32_t m_tiles = rows * (tile_w / HTP_CONV2D_TILE_W);
-        const bool enough_m_tiles =
-            kh * kw == 1 ? (uint64_t) m_tiles * 5 >= (uint64_t) max_m_tiles * 4 :
-                           (uint64_t) m_tiles * 20 >= (uint64_t) max_m_tiles * 19;
-        if (enough_m_tiles) {
-            *kparams = candidate;
-            found = true;
+        bool selected = false;
+        for (uint32_t tile_w = HTP_CONV2D_TILE_W; tile_w <= padded_ow; tile_w += HTP_CONV2D_TILE_W) {
+            struct htp_conv2d_kernel_params candidate;
+            const uint32_t rows = max_tile_rows(n_tiles_per_block, tile_w, &candidate);
+            const uint32_t m_tiles = rows * (tile_w / HTP_CONV2D_TILE_W);
+            const bool enough_m_tiles =
+                kh * kw == 1 ? (uint64_t) m_tiles * 5 >= (uint64_t) max_m_tiles * 4 :
+                               (uint64_t) m_tiles * 20 >= (uint64_t) max_m_tiles * 19;
+            if (enough_m_tiles) {
+                *result = candidate;
+                selected = true;
+            }
+        }
+        return selected;
+    };
+
+    const uint32_t total_n_tiles = (oc + 31u) / 32u;
+    bool found = select_layout(total_n_tiles, kparams);
+    if (!found) {
+        uint64_t best_resident_tiles = 0;
+        uint32_t best_n_tiles = 0;
+        for (uint32_t n_tiles = 1; n_tiles < total_n_tiles; ++n_tiles) {
+            struct htp_conv2d_kernel_params candidate;
+            if (!select_layout(n_tiles, &candidate)) {
+                continue;
+            }
+            const uint64_t resident_tiles = (uint64_t) n_tiles * candidate.m_tiles;
+            if (resident_tiles > best_resident_tiles ||
+                (resident_tiles == best_resident_tiles && n_tiles > best_n_tiles)) {
+                *kparams = candidate;
+                best_resident_tiles = resident_tiles;
+                best_n_tiles = n_tiles;
+                found = true;
+            }
         }
     }
     if (found) {
         if (op->op == GGML_OP_CONV_2D_UPSCALE) {
             kparams->flags |= HTP_CONV2D_UPSCALE2;
+            if (op->src[3] != nullptr) {
+                kparams->flags |= HTP_CONV2D_DUP_UP_RESIDUAL;
+                kparams->residual_factor_t = ggml_get_op_params_i32(op, 7);
+            }
         }
         if (op->op == GGML_OP_CONV_2D_BIAS || op->src[2] != nullptr) {
             kparams->flags |= HTP_CONV2D_BIAS;
         }
-        HEX_VERBOSE("ggml-hex: conv2d tile %ux%u (%u M tiles), VTCM %u/%zu bytes\n",
+        HEX_VERBOSE("ggml-hex: conv2d tile %ux%u (%u M tiles, %u/%u N tiles), VTCM %u/%zu bytes\n",
                     kparams->tile_w, kparams->tile_h, kparams->m_tiles,
+                    kparams->n_tiles_per_block, kparams->n_tiles,
                     kparams->vtcm_size, sess->vtcm_size);
     }
     return found;
@@ -5663,6 +5769,7 @@ static bool ggml_hexagon_supported_conv2d(const struct ggml_hexagon_session * se
     const struct ggml_tensor * weight = op->src[0];
     const struct ggml_tensor * src = op->src[1];
     const struct ggml_tensor * bias = op->src[2];
+    const struct ggml_tensor * residual = op->src[3];
     if (sess->n_hmx == 0 || !weight || !src || weight->type != GGML_TYPE_F16 ||
         (src->type != GGML_TYPE_F32 && src->type != GGML_TYPE_F16) ||
         (op->type != GGML_TYPE_F32 && op->type != GGML_TYPE_F16) ||
@@ -5688,6 +5795,7 @@ static bool ggml_hexagon_supported_conv2d(const struct ggml_hexagon_session * se
     const int32_t upscale = op->op == GGML_OP_CONV_2D_UPSCALE
                                 ? ggml_get_op_params_i32(op, 6)
                                 : 1;
+    const int32_t residual_factor_t = residual ? ggml_get_op_params_i32(op, 7) : 0;
     const int64_t kw = weight->ne[0];
     const int64_t kh = weight->ne[1];
     const int64_t ic = weight->ne[2];
@@ -5700,6 +5808,17 @@ static bool ggml_hexagon_supported_conv2d(const struct ggml_hexagon_session * se
         src->ne[2] != ic || op->ne[2] != oc ||
         op->ne[0] != src->ne[0] * upscale ||
         op->ne[1] != src->ne[1] * upscale) {
+        return false;
+    }
+    if (residual &&
+        (op->op != GGML_OP_CONV_2D_UPSCALE || upscale != 2 ||
+         src->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 ||
+         residual->type != GGML_TYPE_F32 || !ggml_is_contiguous(residual) ||
+         residual->ne[0] != src->ne[0] || residual->ne[1] != src->ne[1] ||
+         residual->ne[2] != 1 || residual->ne[3] % oc != 0 ||
+         !((residual_factor_t == 2 &&
+            (residual->ne[3] == oc || residual->ne[3] == 2 * oc)) ||
+           (residual_factor_t == 1 && residual->ne[3] == 2 * oc)))) {
         return false;
     }
 
@@ -5752,8 +5871,14 @@ static bool ggml_hexagon_supported_conv3d_causal(
     }
 
     struct htp_conv2d_kernel_params kparams;
-    return ggml_hexagon_precompute_conv2d_params(sess, op, &kparams) &&
-           ic % kparams.activation_group_channels == 0;
+    const bool supported = ggml_hexagon_precompute_conv2d_params(sess, op, &kparams) &&
+                           ic % kparams.activation_group_channels == 0;
+    if (supported && kd == 1 && !weight->buffer) {
+        sess->conv2d_weights[weight] = {
+            static_cast<uint32_t>(ic), static_cast<uint32_t>(oc)
+        };
+    }
+    return supported;
 }
 
 static bool ggml_hexagon_supported_rms_norm_mul_silu(const struct ggml_tensor * op) {
@@ -6597,6 +6722,8 @@ static bool ggml_backend_hexagon_cpy_tensor_async(ggml_backend_t backend_src, gg
     auto * dst_extra = static_cast<ggml_hexagon_tensor_extra *>(dst->extra);
     const auto * src_extra = static_cast<const ggml_hexagon_tensor_extra *>(src->extra);
     dst_extra->flags = src_extra->flags & ~GGML_HEXAGON_TENSOR_FUSEABLE;
+    dst_extra->conv_ic = src_extra->conv_ic;
+    dst_extra->conv_oc = src_extra->conv_oc;
 
     auto sess_src = static_cast<ggml_hexagon_session *>(backend_src->context);
     auto sess_dst = static_cast<ggml_hexagon_session *>(backend_dst->context);

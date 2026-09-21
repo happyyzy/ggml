@@ -1168,7 +1168,7 @@ static inline void fa_softmax_impl(
                 }
             } else {
                 size_t c = 0;
-                for (; c + 64 < kv_rows; c += 128) {
+                for (; c + 128 <= kv_rows; c += 128) {
                     size_t             ci0       = c / 64;
                     size_t             ci1       = ci0 + 1;
                     const __fp16 *     in_dtile0 = s_ld_base + ci0 * HMX_FP16_TILE_N_ELMS * 2;
@@ -1275,7 +1275,7 @@ static inline void fa_softmax_impl(
                 }
             } else {
                 size_t c = 0;
-                for (; c + 64 < kv_rows; c += 128) {
+                for (; c + 128 <= kv_rows; c += 128) {
                     size_t ci0 = c / 64;
                     size_t ci1 = ci0 + 1;
                     v_s_rowmax0 = Q6_Vhf_vmax_VhfVhf(v_s_rowmax0, my_row_buf0[ci0]);
@@ -1341,7 +1341,7 @@ static inline void fa_softmax_impl(
             HVX_Vector       v_p_rowsum1 = v_zero;
 
             size_t c = 0;
-            for (; c + 64 < kv_rows; c += 128) {
+            for (; c + 128 <= kv_rows; c += 128) {
                 size_t     ci0          = c / 64;
                 size_t     ci1          = ci0 + 1;
 
@@ -1382,11 +1382,17 @@ static inline void fa_softmax_impl(
             }
             for (size_t c_rem = c; c_rem < kv_rows; c_rem += 64) {
                 size_t     ci           = c_rem / 64;
+                const size_t ne         = hex_smin(kv_rows - c_rem, 64);
+                const HVX_VectorPred q_tail_keep = Q6_Q_vsetq2_R(ne * sizeof(__fp16));
                 HVX_Vector v_s_minus_m0 = Q6_Vqf16_vsub_VhfVhf(my_row_buf0[ci], v_dup_m0);
                 HVX_Vector v_s_minus_m1 = Q6_Vqf16_vsub_VhfVhf(my_row_buf1[ci], v_dup_m1);
 
                 HVX_Vector v_p_row0_hf  = hvx_vec_exp2_f16(Q6_Vhf_equals_Vqf16(v_s_minus_m0));
                 HVX_Vector v_p_row1_hf  = hvx_vec_exp2_f16(Q6_Vhf_equals_Vqf16(v_s_minus_m1));
+                if (ne < 64) {
+                    v_p_row0_hf = Q6_V_vmux_QVV(q_tail_keep, v_p_row0_hf, v_zero);
+                    v_p_row1_hf = Q6_V_vmux_QVV(q_tail_keep, v_p_row1_hf, v_zero);
+                }
                 __fp16 *     out_dtile  = p_st_base + ci * HMX_FP16_TILE_N_ELMS * 2;
                 HVX_Vector * pv_p_out0  = ((HVX_Vector *) out_dtile) + r1 / 2;
                 HVX_Vector * pv_p_out1  = pv_p_out0 + 16;
