@@ -179,5 +179,6 @@ int op_allreduce(struct htp_ops_context * octx);
 int op_qknorm_rope(struct htp_ops_context * octx);
 int op_conv2d(struct htp_ops_context * octx);
 int op_group_norm(struct htp_ops_context * octx);
+int op_rms_norm_mul_silu(struct htp_ops_context * octx);
 
 #endif /* HTP_CTX_H */

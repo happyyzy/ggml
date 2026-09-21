@@ -2144,6 +2144,8 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_MUL_MAT_SEGMENTED:
         case GGML_OP_QKNORM_ROPE:
         case GGML_OP_GROUP_NORM_AFFINE_SILU:
+        case GGML_OP_RMS_NORM_MUL_SILU:
+        case GGML_OP_CONV_3D_CAUSAL:
         case GGML_OP_CONV_2D_BIAS:
         case GGML_OP_CONV_2D_UPSCALE:
             GGML_ABORT("operation is not supported by the CPU backend");
@@ -2498,6 +2500,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_MUL_MAT_SEGMENTED:
         case GGML_OP_QKNORM_ROPE:
         case GGML_OP_GROUP_NORM_AFFINE_SILU:
+        case GGML_OP_RMS_NORM_MUL_SILU:
+        case GGML_OP_CONV_3D_CAUSAL:
         case GGML_OP_CONV_2D_BIAS:
         case GGML_OP_CONV_2D_UPSCALE:
             {

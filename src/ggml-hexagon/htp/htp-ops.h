@@ -109,6 +109,7 @@ enum htp_op_code {
     HTP_OP_CONV_2D,
     HTP_OP_GROUP_NORM,
     HTP_OP_MUL_MAT_SEGMENTED,
+    HTP_OP_RMS_NORM_MUL_SILU,
 
     HTP_OP_INVALID
 };

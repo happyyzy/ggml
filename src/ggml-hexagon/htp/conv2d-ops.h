@@ -14,6 +14,7 @@ enum htp_conv2d_flags {
     HTP_CONV2D_BIAS     = 1u << 0,
     HTP_CONV2D_RESIDUAL = 1u << 1,
     HTP_CONV2D_UPSCALE2 = 1u << 2,
+    HTP_CONV2D_CAUSAL3D = 1u << 3,
 };
 
 struct htp_conv2d_kernel_params {
@@ -32,6 +33,12 @@ struct htp_conv2d_kernel_params {
     uint32_t off_scales;
     uint32_t vtcm_size;
     uint32_t flags;
+    uint32_t kw;
+    uint32_t kh;
+    uint32_t kd;
+    uint32_t ic;
+    uint32_t ic_padded;
+    uint32_t oc;
 };
 
 static inline uint32_t htp_conv2d_align_up(uint32_t value, uint32_t alignment) {
@@ -55,6 +62,12 @@ static inline uint32_t htp_conv2d_layout_build(
 
     p->tile_w = tile_w;
     p->flags = 0;
+    p->kw = kw;
+    p->kh = kh;
+    p->kd = 1;
+    p->ic = ic;
+    p->ic_padded = ic;
+    p->oc = oc;
     p->tile_h = tile_h;
     p->m_tiles = (tile_w / HTP_CONV2D_TILE_W) * tile_h;
     p->k_tiles = k / 32u;

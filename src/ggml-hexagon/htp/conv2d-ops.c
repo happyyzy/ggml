@@ -767,10 +767,10 @@ static void conv2d_init_prepare_state(
         .dy = (uint32_t) (sy_begin - sy0),
         .sx0 = sx0,
         .sy0 = sy0,
-        .kh = octx->src[0]->ne[1],
-        .kw = octx->src[0]->ne[0],
-        .ic_blocks = src->ne[2] / 32,
-        .n_groups = src->ne[2] / kp->activation_group_channels,
+        .kh = kp->kh,
+        .kw = kp->kw,
+        .ic_blocks = kp->ic_padded / 32,
+        .n_groups = kp->ic / kp->activation_group_channels,
         .group_channels = kp->activation_group_channels,
         .k_tiles = kp->k_tiles,
         .activation_k_tiles = kp->activation_k_tiles,
@@ -806,7 +806,77 @@ static void conv2d_prepare_activation(
     struct conv2d_prepare_state state;
     conv2d_init_prepare_state(octx, x, a, x0, y0, tile_w, tile_h,
                               wait_weight_dma, kp, &state);
+    if (kp->ic != kp->ic_padded) {
+        const size_t bytes = (size_t) state.x_tiles * state.halo_h *
+                             state.activation_k_tiles * HTP_CONV2D_TILE_BYTES;
+        memset(a, 0, bytes);
+    }
     work_queue_run(octx->ctx->work_queue, conv2d_prepare_activation_worker, &state, octx->n_threads);
+}
+
+struct conv3d_weight_pack_state {
+    const __fp16 * src;
+    __fp16 * dst;
+    uint32_t kw;
+    uint32_t kh;
+    uint32_t kd;
+    uint32_t ic;
+    uint32_t ic_padded;
+    uint32_t oc;
+};
+
+static void conv3d_pack_current_slice_worker(unsigned int nth, unsigned int ith, void * data) {
+    const struct conv3d_weight_pack_state * st = (const struct conv3d_weight_pack_state *) data;
+    const uint32_t area = st->kw * st->kh;
+    const uint32_t ic_blocks = st->ic_padded / 32u;
+    const uint32_t k_tiles = area * ic_blocks;
+    const uint32_t pairs = (st->oc + 1u) / 2u;
+    const uint32_t first_pair = (uint64_t) pairs * ith / nth;
+    const uint32_t last_pair = (uint64_t) pairs * (ith + 1u) / nth;
+
+    for (uint32_t pair = first_pair; pair < last_pair; ++pair) {
+        const uint32_t oc0 = pair * 2u;
+        const uint32_t oc1 = oc0 + 1u;
+        const uint32_t nt = oc0 / 32u;
+        const uint32_t nr_pair = (oc0 % 32u) / 2u;
+        for (uint32_t s = 0; s < area; ++s) {
+            for (uint32_t ic = 0; ic < st->ic; ++ic) {
+                const uint32_t kt = s * ic_blocks + ic / 32u;
+                const uint32_t kr = ic % 32u;
+                const size_t tile = ((size_t) nt * k_tiles + kt) *
+                                    HTP_MM_HMX_TILE_N_ELMS;
+                const size_t dst_index = tile + nr_pair * 64u + kr * 2u;
+                const size_t src0_index = s + (size_t) area *
+                    ((st->kd - 1u) + (size_t) st->kd * (ic + (size_t) st->ic * oc0));
+                st->dst[dst_index] = st->src[src0_index];
+                if (oc1 < st->oc) {
+                    const size_t src1_index = s + (size_t) area *
+                        ((st->kd - 1u) + (size_t) st->kd * (ic + (size_t) st->ic * oc1));
+                    st->dst[dst_index + 1u] = st->src[src1_index];
+                }
+            }
+        }
+    }
+}
+
+static void conv3d_pack_current_slice(
+        struct htp_ops_context * octx,
+        const struct htp_conv2d_kernel_params * kp,
+        __fp16 * dst) {
+    const __fp16 * src = (const __fp16 *) octx->src[0]->data;
+    memset(dst, 0, (size_t) kp->k_tiles * kp->n_tiles * HTP_CONV2D_TILE_BYTES);
+    struct conv3d_weight_pack_state state = {
+        .src = src,
+        .dst = dst,
+        .kw = kp->kw,
+        .kh = kp->kh,
+        .kd = kp->kd,
+        .ic = kp->ic,
+        .ic_padded = kp->ic_padded,
+        .oc = kp->oc,
+    };
+    work_queue_run(octx->ctx->work_queue, conv3d_pack_current_slice_worker,
+                   &state, octx->n_threads);
 }
 
 struct conv2d_pipeline_state {
@@ -856,17 +926,27 @@ int op_conv2d(struct htp_ops_context * octx) {
     const struct htp_conv2d_kernel_params * kp =
         (const struct htp_conv2d_kernel_params *) octx->kernel_params;
 
+    const bool causal3d = (kp->flags & HTP_CONV2D_CAUSAL3D) != 0;
     if (weight->type != HTP_TYPE_F16 ||
         (src->type != HTP_TYPE_F32 && src->type != HTP_TYPE_F16) ||
         (dst->type != HTP_TYPE_F32 && dst->type != HTP_TYPE_F16) ||
         (src->type == HTP_TYPE_F16 && dst->type != HTP_TYPE_F16) ||
-        src->ne[3] != 1 || dst->ne[3] != 1 || kp->vtcm_size > octx->ctx->vtcm_size) {
+        kp->vtcm_size > octx->ctx->vtcm_size) {
+        return HTP_STATUS_NO_SUPPORT;
+    }
+    if ((!causal3d && (src->ne[2] != kp->ic || src->ne[3] != 1 ||
+                       dst->ne[2] != kp->oc || dst->ne[3] != 1)) ||
+        (causal3d && (src->ne[2] != 1 || src->ne[3] != kp->ic ||
+                      dst->ne[2] != 1 || dst->ne[3] != kp->oc ||
+                      weight->ne[0] != kp->kw || weight->ne[1] != kp->kh ||
+                      weight->ne[2] != kp->kd ||
+                      weight->ne[3] != kp->ic * kp->oc))) {
         return HTP_STATUS_NO_SUPPORT;
     }
     if ((kp->flags & HTP_CONV2D_BIAS) &&
         (!octx->src[2] || octx->src[2]->type != HTP_TYPE_F32 ||
          (uint64_t) octx->src[2]->ne[0] * octx->src[2]->ne[1] *
-         octx->src[2]->ne[2] * octx->src[2]->ne[3] != weight->ne[3])) {
+         octx->src[2]->ne[2] * octx->src[2]->ne[3] != kp->oc)) {
         return HTP_STATUS_NO_SUPPORT;
     }
     if ((kp->flags & HTP_CONV2D_RESIDUAL) &&
@@ -885,9 +965,9 @@ int op_conv2d(struct htp_ops_context * octx) {
         return HTP_STATUS_OK;
     }
 
-    const uint32_t kh = weight->ne[1];
-    const uint32_t ic = weight->ne[2];
-    const uint32_t oc = weight->ne[3];
+    const uint32_t kh = kp->kh;
+    const uint32_t ic = kp->ic_padded;
+    const uint32_t oc = kp->oc;
     const uint32_t ow = dst->ne[0];
     const uint32_t oh = dst->ne[1];
     uint8_t * base = (uint8_t *) octx->ctx->vtcm_base;
@@ -904,10 +984,14 @@ int op_conv2d(struct htp_ops_context * octx) {
     __fp16 * scales = VTCM_LAYOUT_PTR(__fp16, base, kp->off_scales);
 
     dma_queue * q = octx->ctx->dma[0];
-    if (!dma_queue_push(q, dma_make_ptr(b, (const void *) (uintptr_t) weight->data), HTP_CONV2D_TILE_BYTES,
-                        HTP_CONV2D_TILE_BYTES, HTP_CONV2D_TILE_BYTES,
-                        kp->k_tiles * kp->n_tiles)) {
-        return HTP_STATUS_INTERNAL_ERR;
+    if (causal3d) {
+        conv3d_pack_current_slice(octx, kp, b);
+    } else {
+        if (!dma_queue_push(q, dma_make_ptr(b, (const void *) (uintptr_t) weight->data), HTP_CONV2D_TILE_BYTES,
+                            HTP_CONV2D_TILE_BYTES, HTP_CONV2D_TILE_BYTES,
+                            kp->k_tiles * kp->n_tiles)) {
+            return HTP_STATUS_INTERNAL_ERR;
+        }
     }
     hmx_init_column_scales(scales, Q6_V_vsplat_R(0x3c00));
 
@@ -928,7 +1012,7 @@ int op_conv2d(struct htp_ops_context * octx) {
     const uint32_t first_m_tiles = (first_tile_w / HTP_CONV2D_TILE_W) * first_tile_h;
     htp_trace_event_start(&octx->ctx->trace[0], HTP_TRACE_EVT_HVX_A_PREP, 0);
     conv2d_prepare_activation(octx, xbuf, abuf[0], 0, 0,
-                              first_tile_w, first_tile_h, true, kp);
+                              first_tile_w, first_tile_h, !causal3d, kp);
     htp_trace_event_stop(&octx->ctx->trace[0], HTP_TRACE_EVT_HVX_A_PREP, 0);
 
     jobs[0] = (struct conv2d_hmx_job) {

@@ -5097,13 +5097,15 @@ static bool ggml_hexagon_supported_binary(const struct ggml_hexagon_session * se
         return false;
     }
 
-    if (ggml_is_permuted(src0) || ggml_is_permuted(dst)) {
+    if ((ggml_is_permuted(src0) && !ggml_is_contiguous(src0)) ||
+        (ggml_is_permuted(dst) && !ggml_is_contiguous(dst))) {
         return false;
     }
     if (!ggml_are_same_shape(src0, dst)) {
         return false;
     }
-    if (!ggml_can_repeat(src1, src0) || ggml_is_permuted(src1)) {
+    if (!ggml_can_repeat(src1, src0) ||
+        (ggml_is_permuted(src1) && !ggml_is_contiguous(src1))) {
         return false;
     }
 
@@ -5571,20 +5573,37 @@ static bool ggml_hexagon_precompute_conv2d_params(
         const struct ggml_hexagon_session * sess,
         const struct ggml_tensor * op,
         struct htp_conv2d_kernel_params * kparams) {
+    const bool causal3d = op->op == GGML_OP_CONV_3D_CAUSAL;
     const uint32_t kh = (uint32_t) op->src[0]->ne[1];
     const uint32_t kw = (uint32_t) op->src[0]->ne[0];
-    const uint32_t ic = (uint32_t) op->src[0]->ne[2];
-    const uint32_t oc = (uint32_t) op->src[0]->ne[3];
+    const uint32_t kd = causal3d ? (uint32_t) op->src[0]->ne[2] : 1u;
+    const uint32_t ic = causal3d ? (uint32_t) ggml_get_op_params_i32(op, 6) :
+                                   (uint32_t) op->src[0]->ne[2];
+    const uint32_t oc = causal3d ? (uint32_t) (op->src[0]->ne[3] / ic) :
+                                   (uint32_t) op->src[0]->ne[3];
+    const uint32_t ic_padded = causal3d ? (ic + 31u) & ~31u : ic;
     const uint32_t ow = (uint32_t) op->ne[0];
     const uint32_t oh = (uint32_t) op->ne[1];
     const uint32_t input_element_size = (uint32_t) ggml_type_size(op->src[1]->type);
     const uint32_t padded_ow =
         (ow + HTP_CONV2D_TILE_W - 1u) & ~(HTP_CONV2D_TILE_W - 1u);
 
+    auto build_layout = [&](struct htp_conv2d_kernel_params * result,
+                            uint32_t tile_w, uint32_t tile_h) {
+        htp_conv2d_layout_build(result, kh, kw, ic_padded, oc, tile_w, tile_h,
+                                sess->n_threads, input_element_size);
+        result->kd = kd;
+        result->ic = ic;
+        result->ic_padded = ic_padded;
+        if (causal3d) {
+            result->flags |= HTP_CONV2D_CAUSAL3D;
+        }
+        return result->vtcm_size;
+    };
+
     auto max_tile_rows = [&](uint32_t tile_w, struct htp_conv2d_kernel_params * result) {
         struct htp_conv2d_kernel_params candidate;
-        if (htp_conv2d_layout_build(&candidate, kh, kw, ic, oc, tile_w, 1,
-                                    sess->n_threads, input_element_size) > sess->vtcm_size) {
+        if (build_layout(&candidate, tile_w, 1) > sess->vtcm_size) {
             return 0u;
         }
 
@@ -5592,15 +5611,13 @@ static bool ggml_hexagon_precompute_conv2d_params(
         uint32_t hi = oh;
         while (lo < hi) {
             const uint32_t mid = lo + (hi - lo + 1) / 2;
-            if (htp_conv2d_layout_build(&candidate, kh, kw, ic, oc, tile_w, mid,
-                                        sess->n_threads, input_element_size) <= sess->vtcm_size) {
+            if (build_layout(&candidate, tile_w, mid) <= sess->vtcm_size) {
                 lo = mid;
             } else {
                 hi = mid - 1;
             }
         }
-        htp_conv2d_layout_build(result, kh, kw, ic, oc, tile_w, lo,
-                                sess->n_threads, input_element_size);
+        build_layout(result, tile_w, lo);
         return lo;
     };
 
@@ -5692,6 +5709,62 @@ static bool ggml_hexagon_supported_conv2d(const struct ggml_hexagon_session * se
     }
 
     return true;
+}
+
+static bool ggml_hexagon_supported_conv3d_causal(
+        const struct ggml_hexagon_session * sess,
+        const struct ggml_tensor * op) {
+    const struct ggml_tensor * weight = op->src[0];
+    const struct ggml_tensor * src = op->src[1];
+    const struct ggml_tensor * bias = op->src[2];
+    if (sess->n_hmx == 0 || !weight || !src || weight->type != GGML_TYPE_F16 ||
+        (src->type != GGML_TYPE_F32 && src->type != GGML_TYPE_F16) ||
+        (op->type != GGML_TYPE_F32 && op->type != GGML_TYPE_F16) ||
+        (src->type == GGML_TYPE_F16 && op->type != GGML_TYPE_F16) ||
+        !ggml_is_contiguous(weight) || !ggml_is_contiguous(src) ||
+        !ggml_is_contiguous(op)) {
+        return false;
+    }
+
+    const int64_t kw = weight->ne[0];
+    const int64_t kh = weight->ne[1];
+    const int64_t kd = weight->ne[2];
+    const int64_t ic = ggml_get_op_params_i32(op, 6);
+    if (ic <= 0 || weight->ne[3] % ic != 0) {
+        return false;
+    }
+    const int64_t oc = weight->ne[3] / ic;
+    const int32_t s0 = ggml_get_op_params_i32(op, 0);
+    const int32_t s1 = ggml_get_op_params_i32(op, 1);
+    const int32_t p0 = ggml_get_op_params_i32(op, 2);
+    const int32_t p1 = ggml_get_op_params_i32(op, 3);
+    const int32_t d0 = ggml_get_op_params_i32(op, 4);
+    const int32_t d1 = ggml_get_op_params_i32(op, 5);
+    if (!((kw == 1 && kh == 1) || (kw == 3 && kh == 3)) ||
+        (kd != 1 && kd != 3) || s0 != 1 || s1 != 1 || d0 != 1 || d1 != 1 ||
+        p0 != (kw - 1) / 2 || p1 != (kh - 1) / 2 || (ic & 1) != 0 ||
+        src->ne[2] != 1 || src->ne[3] != ic ||
+        op->ne[0] != src->ne[0] || op->ne[1] != src->ne[1] ||
+        op->ne[2] != 1 || op->ne[3] != oc ||
+        (bias && (bias->type != GGML_TYPE_F32 || !ggml_is_contiguous(bias) ||
+                  ggml_nelements(bias) != oc))) {
+        return false;
+    }
+
+    struct htp_conv2d_kernel_params kparams;
+    return ggml_hexagon_precompute_conv2d_params(sess, op, &kparams) &&
+           ic % kparams.activation_group_channels == 0;
+}
+
+static bool ggml_hexagon_supported_rms_norm_mul_silu(const struct ggml_tensor * op) {
+    const struct ggml_tensor * src = op->src[0];
+    const struct ggml_tensor * weight = op->src[1];
+    return src && weight && src->type == GGML_TYPE_F32 &&
+           weight->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+           ggml_get_op_params_i32(op, 0) == 3 &&
+           ggml_is_contiguous(src) && ggml_is_contiguous(weight) &&
+           ggml_is_contiguous(op) && ggml_are_same_shape(src, op) &&
+           ggml_nelements(weight) == src->ne[3];
 }
 
 static bool ggml_hexagon_supported_group_norm(const struct ggml_tensor * op) {
@@ -5913,9 +5986,11 @@ static htp_op_code op_remap_to_htp(const ggml_tensor * t) {
         case GGML_OP_PAD:             return HTP_OP_PAD;
         case GGML_OP_IM2COL:          return HTP_OP_IM2COL;
         case GGML_OP_QKNORM_ROPE:     return HTP_OP_QKNORM_ROPE;
+        case GGML_OP_RMS_NORM_MUL_SILU: return HTP_OP_RMS_NORM_MUL_SILU;
         case GGML_OP_CONV_2D:
         case GGML_OP_CONV_2D_BIAS:
-        case GGML_OP_CONV_2D_UPSCALE: return HTP_OP_CONV_2D;
+        case GGML_OP_CONV_2D_UPSCALE:
+        case GGML_OP_CONV_3D_CAUSAL:  return HTP_OP_CONV_2D;
         case GGML_OP_GROUP_NORM:      return HTP_OP_GROUP_NORM;
         case GGML_OP_GROUP_NORM_AFFINE_SILU: return HTP_OP_GROUP_NORM;
 
@@ -6113,6 +6188,7 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
                 extra->flags |= GGML_HEXAGON_TENSOR_FUSEABLE;
             } else if ((graph->nodes[i]->op == GGML_OP_CONV_2D_BIAS ||
                         graph->nodes[i]->op == GGML_OP_CONV_2D_UPSCALE ||
+                        graph->nodes[i]->op == GGML_OP_CONV_3D_CAUSAL ||
                         graph->nodes[i]->op == GGML_OP_ADD) &&
                        ggml_node_has_n_uses(graph, i, 1)) {
                 extra->flags |= GGML_HEXAGON_TENSOR_FUSEABLE;
@@ -7039,12 +7115,20 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
             supp = ggml_hexagon_supported_conv2d(sess, op);
             break;
 
+        case GGML_OP_CONV_3D_CAUSAL:
+            supp = ggml_hexagon_supported_conv3d_causal(sess, op);
+            break;
+
         case GGML_OP_GROUP_NORM:
             supp = ggml_hexagon_supported_group_norm(op);
             break;
 
         case GGML_OP_GROUP_NORM_AFFINE_SILU:
             supp = ggml_hexagon_supported_group_norm_affine_silu(op);
+            break;
+
+        case GGML_OP_RMS_NORM_MUL_SILU:
+            supp = ggml_hexagon_supported_rms_norm_mul_silu(op);
             break;
 
         case GGML_OP_GATED_DELTA_NET:

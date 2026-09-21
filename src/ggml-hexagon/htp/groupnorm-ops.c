@@ -7,7 +7,171 @@
 #include "htp-ctx.h"
 #include "hvx-reduce.h"
 #include "hvx-sigmoid.h"
+#include "hvx-sqrt.h"
 #include "hvx-utils.h"
+
+struct rms_norm_mul_silu_state {
+    const float * src;
+    const float * weight;
+    float * dst;
+    float * stats;
+    uint32_t spatial;
+    uint32_t channels;
+    uint32_t count;
+    float epsilon;
+};
+
+static void rms_norm_mul_silu_worker(unsigned int nth, unsigned int ith, void * data) {
+    const struct rms_norm_mul_silu_state * st = (const struct rms_norm_mul_silu_state *) data;
+    const uint32_t nvec = st->count / 32u;
+    const uint32_t first = (uint64_t) nvec * ith / nth;
+    const uint32_t last = (uint64_t) nvec * (ith + 1u) / nth;
+    const HVX_Vector inv_channels = hvx_vec_splat_f32(1.0f / (float) st->channels);
+    const HVX_Vector epsilon = hvx_vec_splat_f32(st->epsilon);
+    const HVX_Vector one = hvx_vec_splat_f32(1.0f);
+    const HVX_Vector max_exp = hvx_vec_splat_f32(87.0f);
+    const HVX_Vector min_exp = hvx_vec_splat_f32(-87.0f);
+
+    HVX_Vector * stats = (HVX_Vector *) st->stats;
+    for (uint32_t block = first; block < last; ++block) {
+        stats[block] = Q6_V_vzero();
+    }
+    for (uint32_t c = 0; c < st->channels; ++c) {
+        const float * src = st->src + (size_t) c * st->spatial;
+        for (uint32_t block = first; block < last; ++block) {
+            const HVX_Vector x = hvx_vmemu(src + (size_t) block * 32u);
+            stats[block] = hvx_vec_add_f32_f32(
+                stats[block], hvx_vec_mul_f32_f32(x, x));
+        }
+    }
+    for (uint32_t block = first; block < last; ++block) {
+        stats[block] = hvx_vec_rsqrt_f32(hvx_vec_add_f32_f32(
+            hvx_vec_mul_f32_f32(stats[block], inv_channels), epsilon));
+    }
+    for (uint32_t c = 0; c < st->channels; ++c) {
+        const size_t channel_offset = (size_t) c * st->spatial;
+        const HVX_Vector scale = hvx_vec_splat_f32(st->weight[c]);
+        for (uint32_t block = first; block < last; ++block) {
+            const size_t index = channel_offset + (size_t) block * 32u;
+            HVX_Vector y = hvx_vec_mul_f32_f32(hvx_vmemu(st->src + index), stats[block]);
+            y = hvx_vec_mul_f32_f32(y, scale);
+            y = hvx_vec_mul_f32_f32(y,
+                hvx_vec_fast_sigmoid_f32_guard(y, one, max_exp, min_exp));
+            hvx_vmemu(st->dst + index) = y;
+        }
+    }
+
+    if (ith == 0) {
+        const uint32_t first_tail = nvec * 32u;
+        for (uint32_t local = first_tail; local < st->count; ++local) {
+            float square = 0.0f;
+            for (uint32_t c = 0; c < st->channels; ++c) {
+                const float x = st->src[(size_t) c * st->spatial + local];
+                square += x * x;
+            }
+            const float inv_rms = 1.0f / sqrtf(square / st->channels + st->epsilon);
+            for (uint32_t c = 0; c < st->channels; ++c) {
+                const size_t index = (size_t) c * st->spatial + local;
+                const float y = st->src[index] * inv_rms * st->weight[c];
+                st->dst[index] = y / (1.0f + expf(-y));
+            }
+        }
+    }
+}
+
+int op_rms_norm_mul_silu(struct htp_ops_context * octx) {
+    const struct htp_tensor * src = octx->src[0];
+    const struct htp_tensor * weight = octx->src[1];
+    const struct htp_tensor * dst = octx->dst;
+    float epsilon;
+    __builtin_memcpy(&epsilon, &octx->op_params[1], sizeof(epsilon));
+
+    const uint64_t weight_elems = weight ? (uint64_t) weight->ne[0] * weight->ne[1] *
+                                           weight->ne[2] * weight->ne[3] : 0;
+    if (!src || !weight || !dst || octx->op_params[0] != 3 ||
+        src->type != HTP_TYPE_F32 || weight->type != HTP_TYPE_F32 || dst->type != HTP_TYPE_F32 ||
+        src->ne[0] != dst->ne[0] || src->ne[1] != dst->ne[1] ||
+        src->ne[2] != dst->ne[2] || src->ne[3] != dst->ne[3] ||
+        weight_elems != src->ne[3]) {
+        return HTP_STATUS_NO_SUPPORT;
+    }
+    if (octx->flags & HTP_OPFLAGS_SKIP_COMPUTE) {
+        return HTP_STATUS_OK;
+    }
+
+    const uint32_t full_spatial = src->ne[0] * src->ne[1] * src->ne[2];
+    const uint32_t channels = src->ne[3];
+    const uint32_t chunk = ((octx->ctx->vtcm_size - 128u) /
+                            ((3u * channels + 1u) * sizeof(float))) & ~31u;
+    if (chunk == 0) {
+        return HTP_STATUS_VTCM_TOO_SMALL;
+    }
+
+    struct rms_norm_mul_silu_state state = {
+        .weight = (const float *) weight->data,
+        .channels = channels,
+        .epsilon = epsilon,
+    };
+    dma_queue * queue = octx->ctx->dma[0];
+    const uint32_t tile_stride = channels * chunk;
+    float * tiles[3] = {
+        (float *) octx->ctx->vtcm_base,
+        (float *) octx->ctx->vtcm_base + tile_stride,
+        (float *) octx->ctx->vtcm_base + 2u * tile_stride,
+    };
+    float * stats = (float *) ((uintptr_t) (tiles[2] + tile_stride + 31u) & ~(uintptr_t) 127u);
+    const uint32_t n_chunks = (full_spatial + chunk - 1u) / chunk;
+
+    const uint32_t first_count = hex_smin(chunk, full_spatial);
+    if (!dma_queue_push(queue,
+                           dma_make_ptr(tiles[0], (const float *) src->data),
+                           chunk * sizeof(float), full_spatial * sizeof(float),
+                           first_count * sizeof(float), channels)) {
+        return HTP_STATUS_INTERNAL_ERR;
+    }
+
+    for (uint32_t index = 0; index < n_chunks; ++index) {
+        const uint32_t offset = index * chunk;
+        const uint32_t count = hex_smin(chunk, full_spatial - offset);
+        const uint32_t row_bytes = count * sizeof(float);
+        float * tile = tiles[index % 3u];
+        if (index >= 2u) {
+            (void) dma_queue_pop(queue);
+        }
+        (void) dma_queue_pop(queue);
+
+        if (index + 1u < n_chunks) {
+            const uint32_t next_offset = offset + chunk;
+            const uint32_t next_count = hex_smin(chunk, full_spatial - next_offset);
+            if (!dma_queue_push(queue,
+                                   dma_make_ptr(tiles[(index + 1u) % 3u],
+                                                (const float *) src->data + next_offset),
+                                   chunk * sizeof(float), full_spatial * sizeof(float),
+                                   next_count * sizeof(float), channels)) {
+                return HTP_STATUS_INTERNAL_ERR;
+            }
+        }
+
+        state.src = tile;
+        state.dst = tile;
+        state.stats = stats;
+        state.spatial = chunk;
+        state.count = count;
+        work_queue_run(octx->ctx->worker_pool, rms_norm_mul_silu_worker,
+                       &state, octx->n_threads);
+        asm volatile("syncht" ::: "memory");
+
+        if (!dma_queue_push(queue,
+                               dma_make_ptr((float *) dst->data + offset, tile),
+                               full_spatial * sizeof(float), chunk * sizeof(float),
+                               row_bytes, channels)) {
+            return HTP_STATUS_INTERNAL_ERR;
+        }
+    }
+    dma_queue_flush(queue);
+    asm volatile("syncht" ::: "memory");
+    return HTP_STATUS_OK;
+}
 
 struct group_norm_state {
     struct htp_context * ctx;

@@ -897,6 +897,9 @@ static int execute_op(struct htp_ops_context * octx) {
         case HTP_OP_GROUP_NORM:
             return op_group_norm(octx);
 
+        case HTP_OP_RMS_NORM_MUL_SILU:
+            return op_rms_norm_mul_silu(octx);
+
         case HTP_OP_TRI:
             return op_unary(octx);
 

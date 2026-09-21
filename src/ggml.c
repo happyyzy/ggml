@@ -1110,11 +1110,13 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "MUL_MAT_SEGMENTED",
     "QKNORM_ROPE",
     "GROUP_NORM_AFFINE_SILU",
+    "RMS_NORM_MUL_SILU",
+    "CONV_3D_CAUSAL",
     "CONV_2D_BIAS",
     "CONV_2D_UPSCALE",
 };
 
-static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
+static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1231,11 +1233,13 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "X*concat(Y0,Y1)",
     "qknorm_rope(x,w,theta)",
     "silu(group_norm(x)*w+b)",
+    "silu(rms_norm(x)*w)",
+    "causal_conv3d(x)",
     "conv2d(x)+b",
     "conv2d(upscale(x))",
 };
 
-static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
+static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3335,6 +3339,25 @@ struct ggml_tensor * ggml_group_norm_affine_silu_inplace(
     return ggml_group_norm_affine_silu_impl(ctx, a, weight, bias, n_groups, eps, true);
 }
 
+struct ggml_tensor * ggml_rms_norm_mul_silu(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * weight,
+        int                   norm_dim,
+        float                 eps) {
+    GGML_ASSERT(norm_dim >= 0 && norm_dim < GGML_MAX_DIMS);
+    GGML_ASSERT(weight->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_nelements(weight) == a->ne[norm_dim]);
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
+    ggml_set_op_params_i32(result, 0, norm_dim);
+    ggml_set_op_params_f32(result, 1, eps);
+    result->op     = GGML_OP_RMS_NORM_MUL_SILU;
+    result->src[0] = a;
+    result->src[1] = weight;
+    return result;
+}
+
 // ggml_l2_norm
 
 static struct ggml_tensor * ggml_l2_norm_impl(
@@ -5192,6 +5215,46 @@ struct ggml_tensor * ggml_conv_3d_direct(
     result->src[0] = a;
     result->src[1] = b;
 
+    return result;
+}
+
+struct ggml_tensor * ggml_conv_3d_causal(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * bias,
+        int                   channels,
+        int                   s0,
+        int                   s1,
+        int                   p0,
+        int                   p1,
+        int                   d0,
+        int                   d1) {
+    GGML_ASSERT(b->ne[2] == 1);
+    GGML_ASSERT(b->ne[3] == channels);
+    GGML_ASSERT(a->ne[3] % channels == 0);
+
+    const int64_t oc = a->ne[3] / channels;
+    GGML_ASSERT(bias == NULL || (bias->type == GGML_TYPE_F32 && ggml_nelements(bias) == oc));
+
+    const int64_t ne[4] = {
+        ggml_calc_conv_output_size(b->ne[0], a->ne[0], s0, p0, d0),
+        ggml_calc_conv_output_size(b->ne[1], a->ne[1], s1, p1, d1),
+        1,
+        oc,
+    };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, b->type, 4, ne);
+    ggml_set_op_params_i32(result, 0, s0);
+    ggml_set_op_params_i32(result, 1, s1);
+    ggml_set_op_params_i32(result, 2, p0);
+    ggml_set_op_params_i32(result, 3, p1);
+    ggml_set_op_params_i32(result, 4, d0);
+    ggml_set_op_params_i32(result, 5, d1);
+    ggml_set_op_params_i32(result, 6, channels);
+    result->op     = GGML_OP_CONV_3D_CAUSAL;
+    result->src[0] = a;
+    result->src[1] = b;
+    result->src[2] = bias;
     return result;
 }
 

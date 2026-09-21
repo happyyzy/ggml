@@ -605,6 +605,8 @@ extern "C" {
         GGML_OP_MUL_MAT_SEGMENTED,
         GGML_OP_QKNORM_ROPE,
         GGML_OP_GROUP_NORM_AFFINE_SILU,
+        GGML_OP_RMS_NORM_MUL_SILU,
+        GGML_OP_CONV_3D_CAUSAL,
         GGML_OP_CONV_2D_BIAS,
         GGML_OP_CONV_2D_UPSCALE,
 
@@ -1448,6 +1450,14 @@ extern "C" {
             struct ggml_tensor  * weight,
             struct ggml_tensor  * bias,
             int                   n_groups,
+            float                 eps);
+
+    // RMS normalize across norm_dim, multiply by weight, then apply SiLU.
+    GGML_API struct ggml_tensor * ggml_rms_norm_mul_silu(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * weight,
+            int                   norm_dim,
             float                 eps);
 
     // l2 normalize along rows
@@ -2332,6 +2342,20 @@ extern "C" {
             int                   n_channels,
             int                   n_batch,
             int                   n_channels_out);
+
+    // Single-frame causal Conv3D. Earlier temporal taps are implicit zeroes.
+    GGML_API struct ggml_tensor * ggml_conv_3d_causal(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * bias,
+            int                   channels,
+            int                   s0,
+            int                   s1,
+            int                   p0,
+            int                   p1,
+            int                   d0,
+            int                   d1);
 
     enum ggml_op_pool {
         GGML_OP_POOL_MAX,
