@@ -152,3 +152,72 @@ void ggml_compute_forward_mul(const ggml_compute_params * params, ggml_tensor * 
 void ggml_compute_forward_div(const ggml_compute_params * params, ggml_tensor * dst) {
     binary_op<op_div>(params, dst);
 }
+
+static inline const float * token_param_row(
+        const ggml_tensor * param,
+        int64_t             i2,
+        int64_t             i3) {
+    const int64_t p2 = i2 % param->ne[2];
+    const int64_t p3 = i3 % param->ne[3];
+    return (const float *) ((const char *) param->data + p2*param->nb[2] + p3*param->nb[3]);
+}
+
+void ggml_compute_forward_modulate(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * x      = dst->src[0];
+    const ggml_tensor * scale0 = dst->src[1];
+    const ggml_tensor * shift0 = dst->src[2];
+    const ggml_tensor * scale1 = dst->src[3];
+    const ggml_tensor * shift1 = dst->src[4];
+    const int64_t split        = ggml_get_op_params_i32(dst, 0);
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(scale0->type == GGML_TYPE_F32 && shift0->type == GGML_TYPE_F32);
+    GGML_ASSERT((scale1 == nullptr) == (shift1 == nullptr));
+    GGML_ASSERT(x->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float));
+
+    const auto [ir0, ir1] = get_thread_range(params, x);
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t i3 = ir/(x->ne[2]*x->ne[1]);
+        const int64_t i2 = (ir - i3*x->ne[2]*x->ne[1])/x->ne[1];
+        const int64_t i1 = ir - i3*x->ne[2]*x->ne[1] - i2*x->ne[1];
+        const bool second = i1 >= split && scale1 != nullptr;
+        const ggml_tensor * scale = second ? scale1 : scale0;
+        const ggml_tensor * shift = second ? shift1 : shift0;
+
+        const float * xv = (const float *) ((const char *) x->data + i1*x->nb[1] + i2*x->nb[2] + i3*x->nb[3]);
+        const float * sv = token_param_row(scale, i2, i3);
+        const float * bv = token_param_row(shift, i2, i3);
+        float * yv = (float *) ((char *) dst->data + i1*dst->nb[1] + i2*dst->nb[2] + i3*dst->nb[3]);
+        for (int64_t i0 = 0; i0 < x->ne[0]; ++i0) {
+            yv[i0] = (xv[i0] + xv[i0]*sv[i0]) + bv[i0];
+        }
+    }
+}
+
+void ggml_compute_forward_gated_residual(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * base   = dst->src[0];
+    const ggml_tensor * branch = dst->src[1];
+    const ggml_tensor * gate0  = dst->src[2];
+    const ggml_tensor * gate1  = dst->src[3];
+    const int64_t split        = ggml_get_op_params_i32(dst, 0);
+
+    GGML_ASSERT(base->type == GGML_TYPE_F32 && branch->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(gate0->type == GGML_TYPE_F32);
+    GGML_ASSERT(base->nb[0] == sizeof(float) && branch->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float));
+
+    const auto [ir0, ir1] = get_thread_range(params, base);
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t i3 = ir/(base->ne[2]*base->ne[1]);
+        const int64_t i2 = (ir - i3*base->ne[2]*base->ne[1])/base->ne[1];
+        const int64_t i1 = ir - i3*base->ne[2]*base->ne[1] - i2*base->ne[1];
+        const ggml_tensor * gate = i1 >= split && gate1 != nullptr ? gate1 : gate0;
+
+        const float * bv = (const float *) ((const char *) base->data + i1*base->nb[1] + i2*base->nb[2] + i3*base->nb[3]);
+        const float * uv = (const float *) ((const char *) branch->data + i1*branch->nb[1] + i2*branch->nb[2] + i3*branch->nb[3]);
+        const float * gv = token_param_row(gate, i2, i3);
+        float * yv = (float *) ((char *) dst->data + i1*dst->nb[1] + i2*dst->nb[2] + i3*dst->nb[3]);
+        for (int64_t i0 = 0; i0 < base->ne[0]; ++i0) {
+            yv[i0] = bv[i0] + uv[i0]*gv[i0];
+        }
+    }
+}

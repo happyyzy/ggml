@@ -606,6 +606,8 @@ extern "C" {
         GGML_OP_QKNORM_ROPE,
         GGML_OP_GROUP_NORM_AFFINE_SILU,
         GGML_OP_RMS_NORM_MUL_SILU,
+        GGML_OP_MODULATE,
+        GGML_OP_GATED_RESIDUAL,
         GGML_OP_CONV_3D_CAUSAL,
         GGML_OP_CONV_2D_BIAS,
         GGML_OP_CONV_2D_UPSCALE,
@@ -1459,6 +1461,27 @@ extern "C" {
             struct ggml_tensor  * weight,
             int                   norm_dim,
             float                 eps);
+
+    // Split ne[1] at split and apply x + x*scale + shift to each token range.
+    // If scale1 and shift1 are NULL, scale0 and shift0 are used for both ranges.
+    GGML_API struct ggml_tensor * ggml_modulate(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * scale0,
+            struct ggml_tensor  * shift0,
+            int64_t               split,
+            struct ggml_tensor  * scale1,
+            struct ggml_tensor  * shift1);
+
+    // Split ne[1] at split and apply base + branch*gate to each token range.
+    // If gate1 is NULL, gate0 is used for both ranges.
+    GGML_API struct ggml_tensor * ggml_gated_residual(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * base,
+            struct ggml_tensor  * branch,
+            struct ggml_tensor  * gate0,
+            int64_t               split,
+            struct ggml_tensor  * gate1);
 
     // l2 normalize along rows
     // used in rwkv v7

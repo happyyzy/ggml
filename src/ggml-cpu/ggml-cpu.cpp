@@ -472,6 +472,9 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                 src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         case GGML_OP_CONV_2D:
             return ggml_is_contiguous(op->src[0]);
+        case GGML_OP_MODULATE:
+        case GGML_OP_GATED_RESIDUAL:
+            return op->type == GGML_TYPE_F32;
         case GGML_OP_MUL_MAT_SEGMENTED:
         case GGML_OP_QKNORM_ROPE:
         case GGML_OP_GROUP_NORM_AFFINE_SILU:

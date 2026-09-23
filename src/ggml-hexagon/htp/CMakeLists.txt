@@ -47,6 +47,7 @@ add_library(${HTP_LIB} SHARED
     conv2d-ops.c
     groupnorm-ops.c
     qknorm-rope-ops.c
+    modulation-ops.c
 )
 
 target_compile_definitions(${HTP_LIB} PRIVATE

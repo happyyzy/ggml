@@ -6070,6 +6070,54 @@ static bool ggml_hexagon_supported_tri(const struct ggml_hexagon_session * sess,
     GGML_UNUSED(sess);
 }
 
+static bool ggml_hexagon_supported_modulation(const struct ggml_tensor * op) {
+    const bool gated = op->op == GGML_OP_GATED_RESIDUAL;
+    const ggml_tensor * src0 = op->src[0];
+    const ggml_tensor * src1 = op->src[1];
+    const ggml_tensor * param0 = op->src[gated ? 2 : 1];
+    const ggml_tensor * param1 = op->src[gated ? 3 : 2];
+
+    if (!src0 || !param0 || (!gated && !param1) ||
+        src0->type != GGML_TYPE_F32 || param0->type != GGML_TYPE_F32 ||
+        (!gated && param1->type != GGML_TYPE_F32) || op->type != GGML_TYPE_F32 ||
+        src0->ne[0] % 32 != 0 || !ggml_is_contiguous(src0) || !ggml_is_contiguous(op) ||
+        !ggml_is_contiguous(param0) || (!gated && !ggml_is_contiguous(param1)) ||
+        ggml_nelements(param0) != src0->ne[0] ||
+        (!gated && ggml_nelements(param1) != src0->ne[0]) ||
+        !ggml_are_same_shape(src0, op)) {
+        return false;
+    }
+
+    const int32_t split = ggml_get_op_params_i32(op, 0);
+    if (split < 0 || split > src0->ne[1]) {
+        return false;
+    }
+
+    if (gated) {
+        if (!src1 || src1->type != GGML_TYPE_F32 || !ggml_is_contiguous(src1) ||
+            !ggml_are_same_shape(src0, src1)) {
+            return false;
+        }
+        if (param1 && (param1->type != GGML_TYPE_F32 || !ggml_is_contiguous(param1) ||
+                       ggml_nelements(param1) != src0->ne[0])) {
+            return false;
+        }
+    } else {
+        const ggml_tensor * scale1 = op->src[3];
+        const ggml_tensor * shift1 = op->src[4];
+        if ((scale1 == nullptr) != (shift1 == nullptr)) {
+            return false;
+        }
+        if (scale1 && (scale1->type != GGML_TYPE_F32 || shift1->type != GGML_TYPE_F32 ||
+                       !ggml_is_contiguous(scale1) || !ggml_is_contiguous(shift1) ||
+                       ggml_nelements(scale1) != src0->ne[0] ||
+                       ggml_nelements(shift1) != src0->ne[0])) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static const char * ggml_backend_hexagon_name(ggml_backend_t backend) {
     auto sess = static_cast<ggml_hexagon_session *>(backend->context);
     return sess->c_name();
@@ -6122,6 +6170,8 @@ static htp_op_code op_remap_to_htp(const ggml_tensor * t) {
         case GGML_OP_IM2COL:          return HTP_OP_IM2COL;
         case GGML_OP_QKNORM_ROPE:     return HTP_OP_QKNORM_ROPE;
         case GGML_OP_RMS_NORM_MUL_SILU: return HTP_OP_RMS_NORM_MUL_SILU;
+        case GGML_OP_MODULATE:        return HTP_OP_MODULATE;
+        case GGML_OP_GATED_RESIDUAL:  return HTP_OP_GATED_RESIDUAL;
         case GGML_OP_CONV_2D:
         case GGML_OP_CONV_2D_BIAS:
         case GGML_OP_CONV_2D_UPSCALE:
@@ -7267,6 +7317,11 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
 
         case GGML_OP_RMS_NORM_MUL_SILU:
             supp = ggml_hexagon_supported_rms_norm_mul_silu(op);
+            break;
+
+        case GGML_OP_MODULATE:
+        case GGML_OP_GATED_RESIDUAL:
+            supp = ggml_hexagon_supported_modulation(op);
             break;
 
         case GGML_OP_GATED_DELTA_NET:

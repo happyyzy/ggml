@@ -1111,12 +1111,14 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "QKNORM_ROPE",
     "GROUP_NORM_AFFINE_SILU",
     "RMS_NORM_MUL_SILU",
+    "MODULATE",
+    "GATED_RESIDUAL",
     "CONV_3D_CAUSAL",
     "CONV_2D_BIAS",
     "CONV_2D_UPSCALE",
 };
 
-static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
+static_assert(GGML_OP_COUNT == 110, "GGML_OP_COUNT != 110");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1234,12 +1236,14 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "qknorm_rope(x,w,theta)",
     "silu(group_norm(x)*w+b)",
     "silu(rms_norm(x)*w)",
+    "modulate(x,s0,b0,s1,b1)",
+    "base+branch*gate",
     "causal_conv3d(x)",
     "conv2d(x)+b",
     "conv2d(upscale(x))",
 };
 
-static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
+static_assert(GGML_OP_COUNT == 110, "GGML_OP_COUNT != 110");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3355,6 +3359,70 @@ struct ggml_tensor * ggml_rms_norm_mul_silu(
     result->op     = GGML_OP_RMS_NORM_MUL_SILU;
     result->src[0] = a;
     result->src[1] = weight;
+    return result;
+}
+
+static bool ggml_can_repeat_token_param(
+        const struct ggml_tensor * param,
+        const struct ggml_tensor * x) {
+    return param != NULL &&
+           param->ne[0] == x->ne[0] && param->ne[1] == 1 &&
+           x->ne[2] % param->ne[2] == 0 && x->ne[3] % param->ne[3] == 0;
+}
+
+struct ggml_tensor * ggml_modulate(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * scale0,
+        struct ggml_tensor  * shift0,
+        int64_t               split,
+        struct ggml_tensor  * scale1,
+        struct ggml_tensor  * shift1) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(scale0->type == GGML_TYPE_F32 && shift0->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_can_repeat_token_param(scale0, x));
+    GGML_ASSERT(ggml_can_repeat_token_param(shift0, x));
+    GGML_ASSERT(split >= 0 && split <= x->ne[1] && split <= INT32_MAX);
+    GGML_ASSERT((scale1 == NULL) == (shift1 == NULL));
+    if (scale1 != NULL) {
+        GGML_ASSERT(scale1->type == GGML_TYPE_F32 && shift1->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_can_repeat_token_param(scale1, x));
+        GGML_ASSERT(ggml_can_repeat_token_param(shift1, x));
+    }
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, x);
+    ggml_set_op_params_i32(result, 0, (int32_t) split);
+    result->op     = GGML_OP_MODULATE;
+    result->src[0] = x;
+    result->src[1] = scale0;
+    result->src[2] = shift0;
+    result->src[3] = scale1;
+    result->src[4] = shift1;
+    return result;
+}
+
+struct ggml_tensor * ggml_gated_residual(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * base,
+        struct ggml_tensor  * branch,
+        struct ggml_tensor  * gate0,
+        int64_t               split,
+        struct ggml_tensor  * gate1) {
+    GGML_ASSERT(base->type == GGML_TYPE_F32 && branch->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(base, branch));
+    GGML_ASSERT(gate0->type == GGML_TYPE_F32 && ggml_can_repeat_token_param(gate0, base));
+    GGML_ASSERT(split >= 0 && split <= base->ne[1] && split <= INT32_MAX);
+    if (gate1 != NULL) {
+        GGML_ASSERT(gate1->type == GGML_TYPE_F32 && ggml_can_repeat_token_param(gate1, base));
+    }
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, base);
+    ggml_set_op_params_i32(result, 0, (int32_t) split);
+    result->op     = GGML_OP_GATED_RESIDUAL;
+    result->src[0] = base;
+    result->src[1] = branch;
+    result->src[2] = gate0;
+    result->src[3] = gate1;
     return result;
 }
 

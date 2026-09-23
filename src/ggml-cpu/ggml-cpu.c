@@ -1778,6 +1778,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_div(params, tensor);
             } break;
+        case GGML_OP_MODULATE:
+            {
+                ggml_compute_forward_modulate(params, tensor);
+            } break;
+        case GGML_OP_GATED_RESIDUAL:
+            {
+                ggml_compute_forward_gated_residual(params, tensor);
+            } break;
         case GGML_OP_SQR:
             {
                 ggml_compute_forward_sqr(params, tensor);
@@ -2355,6 +2363,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_SILU_BACK:
         case GGML_OP_MUL:
         case GGML_OP_DIV:
+        case GGML_OP_MODULATE:
+        case GGML_OP_GATED_RESIDUAL:
         case GGML_OP_NORM:
         case GGML_OP_RMS_NORM:
         case GGML_OP_RMS_NORM_BACK:

@@ -900,6 +900,10 @@ static int execute_op(struct htp_ops_context * octx) {
         case HTP_OP_RMS_NORM_MUL_SILU:
             return op_rms_norm_mul_silu(octx);
 
+        case HTP_OP_MODULATE:
+        case HTP_OP_GATED_RESIDUAL:
+            return op_modulation(octx);
+
         case HTP_OP_TRI:
             return op_unary(octx);
 
