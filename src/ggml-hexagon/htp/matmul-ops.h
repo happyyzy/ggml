@@ -17,6 +17,7 @@ extern "C" {
 #define HTP_MM_HMX_TILE_N_ROWS 32
 #define HTP_MM_HMX_TILE_SIZE   (32 * 32 * sizeof(__fp16)) // 2048 bytes
 #define HTP_MM_HMX_TILE_N_ELMS 1024
+#define HTP_MM_HMX_SCALE_BLOCK_SIZE 256
 #define HTP_MM_HMX_MIN_NROWS   4
 
 // --- Weight Repacked Tile Sizes ---
@@ -300,7 +301,7 @@ static inline void htp_mm_hmx_get_2d_chunk_costs(
     const size_t qweight_row_stride = is_quant ? (size_t)(n_k_tiles * aligned_tile_size) / 32 : 0;
 
     *size_per_n_out = (pipeline ? 2 : 1) * (is_quant ? qweight_row_stride : row_stride) +
-                      (direct_f8 ? 0 : (pipeline ? 2 * vec_dot_size : vec_dot_size));
+                      (direct_f8 ? (pipeline ? 16 : 8) : (pipeline ? 2 * vec_dot_size : vec_dot_size));
     *size_per_m_out = vec_dot_size;
     *size_per_mn_out = (pipeline ? 2 : 1) * sizeof(uint16_t);
 }
@@ -331,7 +332,7 @@ struct htp_mm_hmx_vtcm_layout {
     size_t off_act_f32;       // fp32 activation conversion scratch
     size_t off_dst[2];        // [1] is only used when pipelined
     size_t off_scratch[2];    // dequantization scratch pads
-    size_t off_scales;        // HMX scales (256 bytes)
+    size_t off_scales;        // HMX scale/bias blocks, optionally double-buffered
 
     // Cached sizes of regions for HMX kernel use
     size_t weight_area_bytes;
@@ -340,6 +341,7 @@ struct htp_mm_hmx_vtcm_layout {
     size_t output_area_bytes;
     size_t scratch_bytes[2];
     size_t act_head_stride;
+    size_t scale_slot_bytes;
 
     size_t total_bytes;
 };
@@ -419,7 +421,6 @@ static inline void htp_mm_hmx_vtcm_layout_build(
         L->scratch_bytes[0]  = scratch_area_size;
         L->scratch_bytes[1]  = scratch_area_size;
         L->act_head_stride   = act_head_stride;
-
         off = off_group_a + hex_smax(group_b_size, group_c_size);
     } else {
         // HTP_MM_KERNEL_HMX_2D
@@ -438,10 +439,12 @@ static inline void htp_mm_hmx_vtcm_layout_build(
 
         const size_t scratch0_size = direct_f8 ? 0 : hex_align_up(nc * vec_dot_size, HTP_MM_HMX_TILE_SIZE);
         const size_t scratch1_size = pipeline ? scratch0_size : 0;
+        const size_t scale_slot_size = direct_f8 ? (nc / HTP_MM_HMX_TILE_N_COLS) * HTP_MM_HMX_SCALE_BLOCK_SIZE : HTP_MM_HMX_SCALE_BLOCK_SIZE;
+        const size_t scale_area_size = hex_align_up(scale_slot_size * (pipeline ? 2 : 1), HTP_MM_HMX_TILE_SIZE);
 
         // Group A:  Scales and activation tiles (must not overlap with Group B or C)
         size_t off_group_a = 0;
-        VTCM_LAYOUT_ALLOC(off_group_a, off_scales, HTP_MM_HMX_TILE_SIZE); // Padded to 2K for alignment and future persistent data
+        VTCM_LAYOUT_ALLOC(off_group_a, off_scales, scale_area_size);
         VTCM_LAYOUT_ALLOC(off_group_a, off_act, act_area_size);
 
         // Group B: Compute-only buffers (starts at off_group_a)
@@ -470,6 +473,7 @@ static inline void htp_mm_hmx_vtcm_layout_build(
         L->scratch_bytes[0]  = scratch0_size;
         L->scratch_bytes[1]  = scratch1_size;
         L->act_head_stride   = 0;
+        L->scale_slot_bytes  = scale_slot_size;
 
         off = off_group_a + hex_smax(group_b_size, group_c_size);
     }

@@ -2606,7 +2606,9 @@ struct ggml_hexagon_opbatch {
             } else {
                 return false;
             }
-            if (!scale || scale->type != GGML_TYPE_F32 || ggml_nelements(scale) != 1) {
+            if (!scale || scale->type != GGML_TYPE_F32 ||
+                (ggml_nelements(scale) != 1 &&
+                 (ggml_nelements(scale) != mm_out->ne[0] || !ggml_is_contiguous(scale)))) {
                 return false;
             }
         }
@@ -4037,7 +4039,9 @@ static bool ggml_hexagon_flash_attn_is_hmx_eligible(
     const uint32_t DK = q->ne[0];
     const uint32_t DV = v->ne[0];
 
-    if (DK % 64 != 0 || DV % 64 != 0) {
+    // Head dims that are not multiples of 64 are handled by internally padding to
+    // DK_pad/DV_pad = round_up(.,64) and zero-filling the tail lanes.
+    if (DK % 8 != 0 || DV % 8 != 0) {
         return false;
     }
 
@@ -4110,8 +4114,13 @@ static bool ggml_hexagon_precompute_flash_attn_params(
     // Check HMX eligibility
     const struct ggml_tensor * sinks = op->src[4];
     if (ggml_hexagon_flash_attn_is_hmx_eligible(sess, q, k, v, sinks)) {
+        // HMX tiles head_dim in units of 64; when DK/DV are not 64-aligned the kernel
+        // operates on padded dims with zero-filled tail lanes. VTCM budget and chunk-size
+        // are sized for the padded tiles.
+        const uint32_t DK_pad = hex_round_up(DK, 64);
+        const uint32_t DV_pad = hex_round_up(DV, 64);
         size_t Br = 0, Bc = 0;
-        int ret = hmx_fa_find_chunk_size(&Br, &Bc, G, DK, DV, neq1, nek1, sess->vtcm_size, sess->n_threads, kparams->is_q_fp32 != 0);
+        int ret = hmx_fa_find_chunk_size(&Br, &Bc, G, DK_pad, DV_pad, neq1, nek1, sess->vtcm_size, sess->n_threads, kparams->is_q_fp32 != 0);
         if (ret == 0) {
             kparams->kernel_type = HTP_FA_KERNEL_HMX;
             kparams->Br = Br;
@@ -4121,7 +4130,7 @@ static bool ggml_hexagon_precompute_flash_attn_params(
 
             kparams->u.hmx.g_br = hex_align_up(G * Br, 32);
             kparams->u.hmx.pipeline = (kparams->n_kv_blocks >= 3 && sess->n_threads >= 2) ? 1 : 0;
-            kparams->vtcm_size = hmx_fa_compute_vtcm_usage(G, DK, DV, Br, Bc, kparams->n_threads, kparams->u.hmx.pipeline != 0, kparams->is_q_fp32 != 0);
+            kparams->vtcm_size = hmx_fa_compute_vtcm_usage(G, DK_pad, DV_pad, Br, Bc, kparams->n_threads, kparams->u.hmx.pipeline != 0, kparams->is_q_fp32 != 0);
 
             const size_t row_vec_bytes = hex_align_up(Bc * sizeof(uint16_t), 256);
             kparams->u.hmx.row_buf_stride = row_vec_bytes / 128; // HVX vector is 128 bytes
@@ -4300,8 +4309,9 @@ static bool ggml_hexagon_matmul_is_hmx_eligible(
         return false;
     }
 
-    // HMX paths require K aligned to 32.
-    if (ne00 % 32 != 0) {
+    // Flat F16 matmul pads K in VTCM; other paths still require aligned storage.
+    const bool pad_f16_2d = wtype == GGML_TYPE_F16 && !is_matmul_id && !is_batched;
+    if ((pad_f16_2d ? hex_round_up(ne00, 32) : ne00) % 32 != 0) {
         return false;
     }
 
@@ -4611,14 +4621,14 @@ static void ggml_hexagon_precompute_matmul_params_impl(
     const int ne12 = src1->ne[2];
     const int ne13 = src1->ne[3];
 
-    const int wtype = ggml_hexagon_hmx_weight_storage_type(src0->type);
-    const bool is_repack = ggml_hexagon_is_repack_type((ggml_type) wtype);
-    const int ne00_padded = is_repack ? hex_round_up(ne00, 32) : ne00;
-    const int ne01_padded = is_repack ? hex_round_up(ne01, 32) : ne01;
-    const int ne11_padded = hex_round_up(ne11, 32);
-
     const bool is_matmul_id = (dst->op == GGML_OP_MUL_MAT_ID);
     const bool is_batched   = (ne02 * ne03 > 1 || ne12 * ne13 > 1);
+    const int wtype = ggml_hexagon_hmx_weight_storage_type(src0->type);
+    const bool is_repack = ggml_hexagon_is_repack_type((ggml_type) wtype);
+    const bool pad_f16_2d = wtype == GGML_TYPE_F16 && !is_matmul_id && !is_batched;
+    const int ne00_padded = (is_repack || pad_f16_2d) ? hex_round_up(ne00, 32) : ne00;
+    const int ne01_padded = (is_repack || pad_f16_2d) ? hex_round_up(ne01, 32) : ne01;
+    const int ne11_padded = hex_round_up(ne11, 32);
 
     const size_t vtcm_budget = sess->vtcm_size;
 
@@ -6179,7 +6189,8 @@ static bool mm_is_hmx_eligible(const ggml_tensor * t) {
     const bool is_matmul_id = (t->op == GGML_OP_MUL_MAT_ID);
     const bool is_batched   = (src0->ne[2] * src0->ne[3] > 1 || src1->ne[2] * src1->ne[3] > 1);
 
-    const int ne01_padded = is_repack ? hex_round_up(src0->ne[1], 32) : src0->ne[1];
+    const bool pad_f16_2d = wtype == GGML_TYPE_F16 && !is_matmul_id && !is_batched;
+    const int ne01_padded = (is_repack || pad_f16_2d) ? hex_round_up(src0->ne[1], 32) : src0->ne[1];
 
     return ggml_hexagon_matmul_is_hmx_eligible(src0, src1, t, ne01_padded, is_matmul_id, is_batched);
 }
