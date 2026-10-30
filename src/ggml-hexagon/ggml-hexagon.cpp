@@ -2575,7 +2575,14 @@ struct ggml_hexagon_opbatch {
         if (last_node.opcode != HTP_OP_MUL_MAT && last_node.opcode != HTP_OP_MUL_MAT_SEGMENTED) {
             return false;
         }
-        if (last_node.inputs.empty() || last_node.inputs[0]->type != GGML_TYPE_F8_E4M3) {
+        if (last_node.inputs.empty()) {
+            return false;
+        }
+        const auto wtype = ggml_hexagon_hmx_weight_storage_type(last_node.inputs[0]->type);
+        auto * kparams = (struct htp_mm_kernel_params *) last_node.kernel_params;
+        if (wtype != GGML_TYPE_F8_E4M3 &&
+            (wtype != GGML_TYPE_F16 || node.opcode != HTP_OP_SCALE ||
+             kparams->kernel_type != HTP_MM_KERNEL_HMX_2D)) {
             return false;
         }
 
@@ -2585,7 +2592,6 @@ struct ggml_hexagon_opbatch {
         }
 
         const ggml_tensor * scale = nullptr;
-        auto * kparams = (struct htp_mm_kernel_params *) last_node.kernel_params;
         if (node.opcode == HTP_OP_SCALE) {
             if (node.src0() != mm_out || (kparams->scale_flags & HTP_MM_SCALE_PARAM)) {
                 return false;
