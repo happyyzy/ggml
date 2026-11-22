@@ -20,6 +20,7 @@ add_library(${HTP_LIB} SHARED
     work-queue.c
     dma-queue.c
     hmx-queue.c
+    hmx-w4a8-gemm.c
     htp-tensor.c
     matmul-ops.c
     flash-attn-ops.c

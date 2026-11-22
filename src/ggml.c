@@ -1116,9 +1116,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "CONV_3D_CAUSAL",
     "CONV_2D_BIAS",
     "CONV_2D_UPSCALE",
+    "MUL_MAT_CONVROT",
 };
 
-static_assert(GGML_OP_COUNT == 110, "GGML_OP_COUNT != 110");
+static_assert(GGML_OP_COUNT == 111, "GGML_OP_COUNT != 111");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1241,9 +1242,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "causal_conv3d(x)",
     "conv2d(x)+b",
     "conv2d(upscale(x))",
+    "convrot(x)*w*s",
 };
 
-static_assert(GGML_OP_COUNT == 110, "GGML_OP_COUNT != 110");
+static_assert(GGML_OP_COUNT == 111, "GGML_OP_COUNT != 111");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -1920,7 +1922,9 @@ void * ggml_new_buffer(struct ggml_context * ctx, size_t nbytes) {
 }
 
 struct ggml_tensor * ggml_dup_tensor(struct ggml_context * ctx, const struct ggml_tensor * src) {
-    return ggml_new_tensor(ctx, src->type, GGML_MAX_DIMS, src->ne);
+    struct ggml_tensor * result = ggml_new_tensor(ctx, src->type, GGML_MAX_DIMS, src->ne);
+    result->flags |= src->flags & GGML_TENSOR_FLAG_W4_CONVROT;
+    return result;
 }
 
 void ggml_unravel_index(const struct ggml_tensor * tensor, int64_t i, int64_t * i0, int64_t * i1, int64_t * i2, int64_t * i3) {
@@ -3532,6 +3536,35 @@ struct ggml_tensor * ggml_mul_mat(
     result->src[0] = a;
     result->src[1] = b;
 
+    return result;
+}
+
+struct ggml_tensor * ggml_mul_mat_convrot(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * weight,
+        struct ggml_tensor  * activation,
+        struct ggml_tensor  * weight_scale,
+        int32_t               group_size,
+        struct ggml_tensor  * activation_tail) {
+    GGML_ASSERT(activation->type == GGML_TYPE_F32);
+    GGML_ASSERT(weight_scale->type == GGML_TYPE_F32 && ggml_is_vector(weight_scale));
+    GGML_ASSERT(weight_scale->ne[0] == weight->ne[1]);
+    GGML_ASSERT(2 * weight->ne[0] == activation->ne[0] + (activation_tail ? activation_tail->ne[0] : 0));
+    if (activation_tail) {
+        GGML_ASSERT(activation_tail->type == GGML_TYPE_F32);
+        GGML_ASSERT(activation->ne[1] == activation_tail->ne[1]);
+        GGML_ASSERT(activation->ne[2] == activation_tail->ne[2]);
+        GGML_ASSERT(activation->ne[3] == activation_tail->ne[3]);
+    }
+
+    const int64_t ne[4] = { weight->ne[1], activation->ne[1], activation->ne[2], activation->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+    result->op = GGML_OP_MUL_MAT_CONVROT;
+    result->src[0] = weight;
+    result->src[1] = activation;
+    result->src[2] = weight_scale;
+    result->src[3] = activation_tail;
+    ggml_set_op_params_i32(result, 0, group_size);
     return result;
 }
 

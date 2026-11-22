@@ -476,6 +476,7 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         case GGML_OP_GATED_RESIDUAL:
             return op->type == GGML_TYPE_F32;
         case GGML_OP_MUL_MAT_SEGMENTED:
+        case GGML_OP_MUL_MAT_CONVROT:
         case GGML_OP_QKNORM_ROPE:
         case GGML_OP_GROUP_NORM_AFFINE_SILU:
         case GGML_OP_RMS_NORM_MUL_SILU:

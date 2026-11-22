@@ -262,6 +262,17 @@ static inline bool ggml_hexagon_is_hmx_weight_type(enum ggml_type type) {
     return type == GGML_TYPE_F16 || type == GGML_TYPE_F32 || ggml_hexagon_is_repack_type(type);
 }
 
+static bool ggml_hexagon_is_convrot_weight(const ggml_tensor * t) {
+    return t->type == GGML_TYPE_I8 && (t->flags & GGML_TENSOR_FLAG_W4_CONVROT) &&
+           ggml_is_matrix(t) && ggml_is_contiguous(t) &&
+           t->ne[0] > 0 && t->ne[0] <= 32768 && t->ne[0] % 128 == 0 &&
+           t->ne[1] > 0 && t->ne[1] % 64 == 0;
+}
+
+static size_t ggml_hexagon_convrot_weight_size(const ggml_tensor * t) {
+    return ggml_nbytes(t) + t->ne[1] * sizeof(int32_t);
+}
+
 static inline enum ggml_type ggml_hexagon_hmx_weight_storage_type(enum ggml_type type) {
     return type == GGML_TYPE_BF16 ? GGML_TYPE_F16 : type;
 }
@@ -744,7 +755,9 @@ static enum ggml_status ggml_backend_hexagon_buffer_init_tensor(ggml_backend_buf
         extra->conv_oc = conv->second.second;
         sess->conv2d_weights.erase(conv);
     }
-    if (ggml_hexagon_is_repack_type(tensor->type)) {
+    if (ggml_hexagon_is_convrot_weight(tensor)) {
+        extra->flags |= GGML_HEXAGON_TENSOR_REPACK;
+    } else if (ggml_hexagon_is_repack_type(tensor->type)) {
         if (sess->needs_repack.count(tensor)) {
             extra->flags |= GGML_HEXAGON_TENSOR_REPACK;
             sess->needs_repack.erase(tensor);
@@ -1499,6 +1512,54 @@ static void convert_f16_weights_to_bf16(void * dst, const void * src, size_t siz
     }
 }
 
+static int sum_s4_pair(uint8_t x) {
+    return (x & 7) - (x & 8) + ((x >> 4) & 7) - (x >> 7) * 8;
+}
+
+static void repack_convrot_weight(ggml_tensor * tensor, const void * data) {
+    const size_t n = tensor->ne[1];
+    const size_t row_bytes = tensor->ne[0];
+    const auto * src = (const uint8_t *) data;
+    auto * dst = (uint8_t *) tensor->data;
+    auto * correction = (int32_t *) (dst + ggml_nbytes(tensor));
+    std::fill_n(correction, n, 0);
+
+    // Each HMX byte holds two columns 32 apart at the same K coordinate.
+    for (size_t col = 0; col < n; col += 64) {
+        for (size_t tile = 0; tile < row_bytes; tile += 16) {
+            for (size_t q = tile; q < tile + 16; q += 2) {
+                for (size_t lane = col; lane < col + 32; ++lane) {
+                    const uint8_t * lo = src + lane * row_bytes + q;
+                    const uint8_t * hi = lo + 32 * row_bytes;
+                    for (int j = 0; j < 2; ++j) {
+                        *dst++ = (lo[j] & 0x0f) | (hi[j] << 4);
+                        *dst++ = (lo[j] >> 4) | (hi[j] & 0xf0);
+                    }
+                    correction[lane] += sum_s4_pair(lo[0]) + sum_s4_pair(lo[1]);
+                    correction[lane + 32] += sum_s4_pair(hi[0]) + sum_s4_pair(hi[1]);
+                }
+            }
+        }
+    }
+    for (size_t col = 0; col < n; ++col) {
+        correction[col] *= -128;
+    }
+}
+
+static void unpack_convrot_weight(void * data, const ggml_tensor * tensor, size_t offset, size_t size) {
+    const size_t row_bytes = tensor->ne[0];
+    const auto * src = (const uint8_t *) tensor->data;
+    auto * dst = (uint8_t *) data;
+    for (size_t i = offset; i < offset + size; ++i) {
+        const size_t col = i / row_bytes;
+        const size_t q = i % row_bytes;
+        const size_t tile = (col / 64 * (row_bytes / 16) + q / 16) * 1024;
+        const size_t lane = (q % 16 / 2) * 128 + (col % 32) * 4 + (q % 2) * 2;
+        const unsigned shift = col % 64 < 32 ? 0 : 4;
+        *dst++ = ((src[tile + lane] >> shift) & 0x0f) | (((src[tile + lane + 1] >> shift) & 0x0f) << 4);
+    }
+}
+
 static void repack_tensor_tiled(ggml_tensor * tensor, const void * data, size_t size) {
     switch (tensor->type) {
         case GGML_TYPE_Q4_0:
@@ -1523,6 +1584,10 @@ static void repack_tensor_tiled(ggml_tensor * tensor, const void * data, size_t 
 
         case GGML_TYPE_F8_E4M3:
             repack_f8_e4m3_tiled(tensor, data, size);
+            break;
+
+        case GGML_TYPE_I8:
+            repack_convrot_weight(tensor, data);
             break;
 
         default:
@@ -1675,6 +1740,10 @@ static void ggml_backend_hexagon_buffer_get_tensor(ggml_backend_buffer_t buffer,
             repack_tiled_f8_e4m3(data, tensor, offset, size);
             break;
 
+        case GGML_TYPE_I8:
+            unpack_convrot_weight(data, tensor, offset, size);
+            break;
+
         default:
             memcpy(data, (const char *) tensor->data + offset, size);
             break;
@@ -1755,6 +1824,13 @@ static void ggml_backend_hexagon_buffer_get_tensor_2d(ggml_backend_buffer_t buff
     if ((extra->flags & GGML_HEXAGON_TENSOR_REPACK) == 0) {
         for (size_t i = 0; i < n_copies; i++) {
             memcpy((uint8_t *)data + i * stride_data, (const uint8_t *)tensor->data + offset + i * stride_tensor, size);
+        }
+        return;
+    }
+
+    if (tensor->type == GGML_TYPE_I8) {
+        for (size_t i = 0; i < n_copies; ++i) {
+            unpack_convrot_weight((uint8_t *) data + i * stride_data, tensor, offset + i * stride_tensor, size);
         }
         return;
     }
@@ -1918,6 +1994,9 @@ static size_t ggml_backend_hexagon_buffer_type_get_alloc_size(ggml_backend_buffe
     }
     if (ggml_hexagon_is_conv2d_hmx_weight(t)) {
         return (size_t) t->ne[0] * t->ne[1] * t->ne[2] * hex_round_up(t->ne[3], 32) * sizeof(ggml_fp16_t);
+    }
+    if (ggml_hexagon_is_convrot_weight(t)) {
+        return ggml_hexagon_convrot_weight_size(t);
     }
     if (ggml_hexagon_is_repack_type(t->type)) {
         int64_t ne0 = hex_round_up(t->ne[0], 32);
@@ -2139,7 +2218,7 @@ struct ggml_hexagon_opbatch {
             h.ne[0] = t->ne[0]; h.ne[1] = t->ne[1]; h.ne[2] = t->ne[2]; h.ne[3] = t->ne[3];
             h.nb[0] = t->nb[0]; h.nb[1] = t->nb[1]; h.nb[2] = t->nb[2]; h.nb[3] = t->nb[3];
             t_size = h.size;
-        } else if (is_repack) {
+        } else if (is_repack && t->type != GGML_TYPE_I8) {
             h.ne[0] = hex_round_up(t->ne[0], 32);
             h.ne[1] = hex_round_up(t->ne[1], 32);
             h.ne[2] = t->ne[2];
@@ -2152,6 +2231,9 @@ struct ggml_hexagon_opbatch {
             h.size  = h.nb[3] * h.ne[3];
             t_size  = h.size;
         } else {
+            if (is_repack) {
+                t_size = ggml_hexagon_convrot_weight_size(t);
+            }
             h.size  = t_size;
             h.ne[0] = t->ne[0]; h.ne[1] = t->ne[1]; h.ne[2] = t->ne[2]; h.ne[3] = t->ne[3];
             h.nb[0] = t->nb[0]; h.nb[1] = t->nb[1]; h.nb[2] = t->nb[2]; h.nb[3] = t->nb[3];
@@ -6139,6 +6221,7 @@ static htp_op_code op_remap_to_htp(const ggml_tensor * t) {
     switch (t->op) {
         case GGML_OP_FLASH_ATTN_EXT:  return HTP_OP_FLASH_ATTN_EXT;
         case GGML_OP_MUL_MAT:         return HTP_OP_MUL_MAT;
+        case GGML_OP_MUL_MAT_CONVROT: return HTP_OP_MUL_MAT_CONVROT;
         case GGML_OP_MUL_MAT_ID:      return HTP_OP_MUL_MAT_ID;
         case GGML_OP_MUL_MAT_SEGMENTED: return HTP_OP_MUL_MAT_SEGMENTED;
         case GGML_OP_MUL:             return HTP_OP_MUL;
@@ -7189,6 +7272,15 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
         case GGML_OP_MUL_MAT:
             supp = ggml_hexagon_supported_mul_mat(sess, op);
             break;
+
+        case GGML_OP_MUL_MAT_CONVROT: {
+            const int group = ggml_get_op_params_i32(op, 0);
+            supp = sess->n_hmx != 0 && ggml_hexagon_is_convrot_weight(op->src[0]) &&
+                   (group == 4 || group == 16 || group == 64 || group == 256) &&
+                   ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op->src[2]) &&
+                   (!op->src[3] || ggml_is_contiguous(op->src[3]));
+            break;
+        }
 
         case GGML_OP_MUL_MAT_SEGMENTED:
             supp = ggml_hexagon_supported_mul_mat_segmented(sess, op);

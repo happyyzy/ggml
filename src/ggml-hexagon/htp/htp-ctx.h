@@ -150,6 +150,7 @@ static inline void htp_ops_context_set_status(struct htp_ops_context * octx, int
 
 int op_matmul(struct htp_ops_context * octx);
 int op_matmul_segmented(struct htp_ops_context * octx);
+int op_matmul_convrot(struct htp_ops_context * octx);
 int op_matmul_id(struct htp_ops_context * octx);
 int op_matmul_nx(struct htp_ops_context * octx);
 int op_matmul_id_nx(struct htp_ops_context * octx);
