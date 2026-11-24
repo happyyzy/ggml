@@ -1923,7 +1923,7 @@ void * ggml_new_buffer(struct ggml_context * ctx, size_t nbytes) {
 
 struct ggml_tensor * ggml_dup_tensor(struct ggml_context * ctx, const struct ggml_tensor * src) {
     struct ggml_tensor * result = ggml_new_tensor(ctx, src->type, GGML_MAX_DIMS, src->ne);
-    result->flags |= src->flags & GGML_TENSOR_FLAG_W4_CONVROT;
+    result->flags |= src->flags & (GGML_TENSOR_FLAG_W4_CONVROT | GGML_TENSOR_FLAG_W8_CONVROT);
     return result;
 }
 
@@ -3549,7 +3549,9 @@ struct ggml_tensor * ggml_mul_mat_convrot(
     GGML_ASSERT(activation->type == GGML_TYPE_F32);
     GGML_ASSERT(weight_scale->type == GGML_TYPE_F32 && ggml_is_vector(weight_scale));
     GGML_ASSERT(weight_scale->ne[0] == weight->ne[1]);
-    GGML_ASSERT(2 * weight->ne[0] == activation->ne[0] + (activation_tail ? activation_tail->ne[0] : 0));
+    const bool w8 = weight->flags & GGML_TENSOR_FLAG_W8_CONVROT;
+    const int64_t k = (w8 ? 1 : 2) * weight->ne[0];
+    GGML_ASSERT(k == activation->ne[0] + (activation_tail ? activation_tail->ne[0] : 0));
     if (activation_tail) {
         GGML_ASSERT(activation_tail->type == GGML_TYPE_F32);
         GGML_ASSERT(activation->ne[1] == activation_tail->ne[1]);
@@ -3565,6 +3567,7 @@ struct ggml_tensor * ggml_mul_mat_convrot(
     result->src[2] = weight_scale;
     result->src[3] = activation_tail;
     ggml_set_op_params_i32(result, 0, group_size);
+    ggml_set_op_params_i32(result, 1, w8 ? 8 : 4);
     return result;
 }
 

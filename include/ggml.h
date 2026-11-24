@@ -678,6 +678,7 @@ extern "C" {
         GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
         GGML_TENSOR_FLAG_W4_CONVROT = 32, // I8 storage with two signed weights per byte
+        GGML_TENSOR_FLAG_W8_CONVROT = 64, // I8 storage with one signed weight per byte
     };
 
     enum ggml_tri_type {
@@ -1549,7 +1550,7 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
 
-    // Packed ConvRot I4 weights, F32 activations and one F32 scale per output.
+    // ConvRot I4 or I8 weights, F32 activations and one F32 scale per output.
     GGML_API struct ggml_tensor * ggml_mul_mat_convrot(
             struct ggml_context * ctx,
             struct ggml_tensor  * weight,

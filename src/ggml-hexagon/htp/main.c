@@ -800,7 +800,7 @@ static int execute_op(struct htp_ops_context * octx) {
             return op_matmul_segmented(octx);
 
         case HTP_OP_MUL_MAT_CONVROT:
-            return op_matmul_convrot(octx);
+            return octx->op_params[1] == 8 ? op_matmul_convrot_w8a8(octx) : op_matmul_convrot(octx);
 
         case HTP_OP_MUL:
         case HTP_OP_ADD:

@@ -263,9 +263,10 @@ static inline bool ggml_hexagon_is_hmx_weight_type(enum ggml_type type) {
 }
 
 static bool ggml_hexagon_is_convrot_weight(const ggml_tensor * t) {
-    return t->type == GGML_TYPE_I8 && (t->flags & GGML_TENSOR_FLAG_W4_CONVROT) &&
+    const bool w8 = t->flags & GGML_TENSOR_FLAG_W8_CONVROT;
+    return t->type == GGML_TYPE_I8 && (t->flags & (GGML_TENSOR_FLAG_W4_CONVROT | GGML_TENSOR_FLAG_W8_CONVROT)) &&
            ggml_is_matrix(t) && ggml_is_contiguous(t) &&
-           t->ne[0] > 0 && t->ne[0] <= 32768 && t->ne[0] % 128 == 0 &&
+           t->ne[0] > 0 && t->ne[0] <= (w8 ? 65536 : 32768) && t->ne[0] % (w8 ? 256 : 128) == 0 &&
            t->ne[1] > 0 && t->ne[1] % 64 == 0;
 }
 
@@ -1516,7 +1517,36 @@ static int sum_s4_pair(uint8_t x) {
     return (x & 7) - (x & 8) + ((x >> 4) & 7) - (x >> 7) * 8;
 }
 
+static void repack_convrot_weight_w8(ggml_tensor * tensor, const void * data) {
+    const size_t k = tensor->ne[0];
+    const size_t n = tensor->ne[1];
+    const auto * src = (const int8_t *) data;
+    auto * dst = (int8_t *) tensor->data;
+    auto * correction = (int32_t *) (dst + ggml_nbytes(tensor));
+    std::fill_n(correction, n, 0);
+
+    // weight.b:deep reads two N32 tiles for each K32 activation tile.
+    for (size_t col = 0; col < n; col += 64) {
+        for (size_t tile = 0; tile < k; tile += 32) {
+            for (size_t half = 0; half < 64; half += 32) {
+                for (size_t q = tile; q < tile + 32; q += 4) {
+                    for (size_t lane = col + half; lane < col + half + 32; ++lane) {
+                        const int8_t * row = src + lane * k + q;
+                        memcpy(dst, row, 4);
+                        dst += 4;
+                        correction[lane] -= 128 * (row[0] + row[1] + row[2] + row[3]);
+                    }
+                }
+            }
+        }
+    }
+}
+
 static void repack_convrot_weight(ggml_tensor * tensor, const void * data) {
+    if (tensor->flags & GGML_TENSOR_FLAG_W8_CONVROT) {
+        repack_convrot_weight_w8(tensor, data);
+        return;
+    }
     const size_t n = tensor->ne[1];
     const size_t row_bytes = tensor->ne[0];
     const auto * src = (const uint8_t *) data;
@@ -1550,6 +1580,16 @@ static void unpack_convrot_weight(void * data, const ggml_tensor * tensor, size_
     const size_t row_bytes = tensor->ne[0];
     const auto * src = (const uint8_t *) tensor->data;
     auto * dst = (uint8_t *) data;
+    if (tensor->flags & GGML_TENSOR_FLAG_W8_CONVROT) {
+        for (size_t i = offset; i < offset + size; ++i) {
+            const size_t col = i / row_bytes;
+            const size_t d = i % row_bytes;
+            const size_t tile = (col / 64 * (row_bytes / 32) + d / 32) * 2048;
+            const size_t lane = (col % 64 / 32) * 1024 + (d % 32 / 4) * 128 + (col % 32) * 4 + d % 4;
+            *dst++ = src[tile + lane];
+        }
+        return;
+    }
     for (size_t i = offset; i < offset + size; ++i) {
         const size_t col = i / row_bytes;
         const size_t q = i % row_bytes;
